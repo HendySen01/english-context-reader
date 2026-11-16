@@ -2,19 +2,29 @@
 import { computed, ref, watch, onBeforeUnmount, onMounted } from 'vue'
 import { entries as mockEntries, passage as defaultPassage } from './data/entries.js'
 import { supabase } from './lib/supabase.js'
+import { calculateReviewSchedule, shuffled } from './lib/srs.js'
+import { baseForm, escapeRegExp, inflectionForms, isInflectionNear, makeTargetMatcher, normalize, splitArticleSentences, tokenizeSentence } from './lib/text.js'
+import { cacheWord, dedupeSentences, isTranslationMissing, makeCacheKey, mergeSentences, sentenceKey, sentencePreview } from './lib/sentences.js'
+import { buildAnkiCsv, buildStarredNotesCsv } from './lib/csv.js'
+import { createBackupJson, parseBackupData } from './lib/backup.js'
+import { calculateStreakDays, localDateKey } from './lib/date.js'
+import { readStorage, readStorageJson, writeStorage, writeStorageJson } from './lib/storage.js'
+import AuthModal from './components/AuthModal.vue'
+import SettingsModal from './components/SettingsModal.vue'
+import ImportConfirmModal from './components/ImportConfirmModal.vue'
 
 const STORE = 'context-reader-state-v1'
 const DEFAULT_PASSAGE = { id: 'default', sentence: 'After hours of driving, we finally found a quiet parking space behind the museum.', translation: '开了几个小时的车后，我们终于在博物馆后面找到一个安静的停车位。' }
-const saved = (() => { try { return JSON.parse(localStorage.getItem(STORE) || '{}') } catch { return {} } })()
+const saved = readStorageJson(localStorage, STORE, {})
 const passages = ref([DEFAULT_PASSAGE, ...(saved.passages || []).filter(p => p.id !== 'default')])
 // 只恢复新版语境缓存，丢弃旧的单词级缓存。
 const cache = ref(Object.fromEntries(Object.entries(saved.cache || {}).filter(([, value]) => value?.llmSuccess === true && value?.deepSchema === 4)))
-const apiKey = ref(localStorage.getItem('context-reader-api-key') || '')
-const apiBaseUrl = ref(localStorage.getItem('context-reader-base-url') || 'https://api.openai.com/v1')
-const apiModel = ref(localStorage.getItem('context-reader-model') || 'gpt-4o-mini')
+const apiKey = ref(readStorage(localStorage, 'context-reader-api-key', '') || '')
+const apiBaseUrl = ref(readStorage(localStorage, 'context-reader-base-url', '') || 'https://api.openai.com/v1')
+const apiModel = ref(readStorage(localStorage, 'context-reader-model', '') || 'gpt-4o-mini')
 const speakingExample = ref('')
 let currentUtterance = null
-const defaultBlurTranslation = ref(localStorage.getItem('context-reader-blur-translation') !== 'false')
+const defaultBlurTranslation = ref(readStorage(localStorage, 'context-reader-blur-translation', null) !== 'false')
 const translationVisible = ref(!defaultBlurTranslation.value)
 const sentenceSpeaking = ref(false)
 const sentenceSpeechRate = ref(1)
@@ -43,15 +53,13 @@ const selectionReady = ref(false)
 const loading = ref(false)
 const error = ref('')
 const syncNotice = ref('')
-const backupInput = ref(null)
 const user = ref(null)
 const showAuth = ref(false)
-const authMode = ref('login')
-const authEmail = ref('')
-const authPassword = ref('')
 const authBusy = ref(false)
 const authError = ref('')
 const authMessage = ref('')
+const authResetModeVersion = ref(0)
+const authResetPasswordVersion = ref(0)
 let authSubscription
 const cloudSyncing = ref(false)
 let cloudLoadSequence = 0
@@ -80,8 +88,9 @@ const clozeWasCorrect = ref(false)
 const clozeCorrectCount = ref(0)
 const clozeRoundFinished = ref(false)
 const reviewStats = ref({ todayCount: 0, streakDays: 0 })
-const dailyReviewGoal = ref([5, 10, 20, 30].includes(Number(localStorage.getItem('context-reader-daily-review-goal')))
-  ? Number(localStorage.getItem('context-reader-daily-review-goal'))
+const storedDailyReviewGoal = Number(readStorage(localStorage, 'context-reader-daily-review-goal', null))
+const dailyReviewGoal = ref([5, 10, 20, 30].includes(storedDailyReviewGoal)
+  ? storedDailyReviewGoal
   : 10)
 const goalCelebration = ref(false)
 const dailyGoalProgress = computed(() => Math.min(100, (reviewStats.value.todayCount / dailyReviewGoal.value) * 100))
@@ -120,11 +129,9 @@ const clozeMaskedSentence = computed(() => {
   try { return sentence.replace(makeTargetMatcher(reviewCard.value.word), match => '_'.repeat(match.length)) } catch { return sentence }
 })
 const activePassage = computed(() => passages.value.find(p => p.id === activePassageId.value) || passages.value[0])
-// 用稳定句子 id 隔离不同语境下的同一词条解析。
-function makeCacheKey(passageId, key) { return `${passageId}::${key}` }
 function restoreCurrentSelection(markReady = true) {
   let savedSelection = null
-  try { savedSelection = JSON.parse(localStorage.getItem('crr:current') || 'null') } catch { savedSelection = null }
+  savedSelection = readStorageJson(localStorage, 'crr:current', null)
   const target = savedSelection?.english
     ? passages.value.find(passage => passage.sentence.trim() === savedSelection.english.trim())
     : null
@@ -140,7 +147,6 @@ const articleSentences = computed(() => splitArticleSentences(articleText.value)
 const checkedArticleSentences = computed(() => articleSentences.value.filter((_, index) => articleChecks.value[index] !== false))
 const activePassageIndex = computed(() => availablePassages.value.findIndex(p => p.id === activePassageId.value))
 const undoDeleteNotice = computed(() => Object.values(pendingDeletes.value).at(-1) || null)
-const sentencePreview = sentence => sentence.trim().split(/\s+/).slice(0, 8).join(' ')
 const mockMap = Object.fromEntries(mockEntries.map(entry => [entry.text.toLowerCase(), entry]))
 // 面板按当前句子与词条共同读取缓存，避免跨句复用解析。
 const selected = computed(() => cache.value[makeCacheKey(activePassage.value.id, selectedId.value)] || mockMap[selectedId.value] || placeholder(selectedId.value))
@@ -153,19 +159,19 @@ watch([passages, cache], () => {
     const { is_starred, review_count, next_review_at, ...analysis } = value || {}
     return [key, analysis]
   }))
-  localStorage.setItem(STORE, JSON.stringify({ passages: [DEFAULT_PASSAGE, ...passages.value.filter(p => p.id !== 'default')], cache: safeCache }))
+  writeStorageJson(localStorage, STORE, { passages: [DEFAULT_PASSAGE, ...passages.value.filter(p => p.id !== 'default')], cache: safeCache })
 }, { deep: true })
-watch(apiKey, value => localStorage.setItem('context-reader-api-key', value))
-watch(apiBaseUrl, value => localStorage.setItem('context-reader-base-url', value))
-watch(apiModel, value => localStorage.setItem('context-reader-model', value))
-watch(dailyReviewGoal, value => localStorage.setItem('context-reader-daily-review-goal', String(value)))
+watch(apiKey, value => writeStorage(localStorage, 'context-reader-api-key', value))
+watch(apiBaseUrl, value => writeStorage(localStorage, 'context-reader-base-url', value))
+watch(apiModel, value => writeStorage(localStorage, 'context-reader-model', value))
+watch(dailyReviewGoal, value => writeStorage(localStorage, 'context-reader-daily-review-goal', value))
 watch([activePassageId, selectedId], () => {
   if (!selectionReady.value || !activePassage.value?.sentence) return
-  localStorage.setItem('crr:current', JSON.stringify({ english: activePassage.value.sentence.trim(), word: selectedId.value }))
+  writeStorageJson(localStorage, 'crr:current', { english: activePassage.value.sentence.trim(), word: selectedId.value })
 })
 watch(articleText, () => { articleChecks.value = {}; articleImportMessage.value = '' })
 watch(defaultBlurTranslation, value => {
-  localStorage.setItem('context-reader-blur-translation', String(value))
+  writeStorage(localStorage, 'context-reader-blur-translation', value)
   translationVisible.value = !value
 })
 watch(activePassageId, () => {
@@ -194,7 +200,7 @@ watch([() => user.value?.id || null, importAttempt], async ([nextUserId]) => {
   const sequence = ++cloudLoadSequence
   selectionReady.value = false
   if (!supabase || !nextUser) {
-    try { const local = JSON.parse(localStorage.getItem(STORE) || '{}'); passages.value = [DEFAULT_PASSAGE, ...(local.passages || []).filter(p => p.id !== 'default')]; cache.value = Object.fromEntries(Object.entries(local.cache || {}).map(([key, value]) => { const { is_starred, review_count, next_review_at, ...rest } = value || {}; return [key, rest] })); restoreCurrentSelection() } catch { passages.value = [DEFAULT_PASSAGE]; restoreCurrentSelection() }
+    try { const local = readStorageJson(localStorage, STORE, {}); passages.value = [DEFAULT_PASSAGE, ...(local.passages || []).filter(p => p.id !== 'default')]; cache.value = Object.fromEntries(Object.entries(local.cache || {}).map(([key, value]) => { const { is_starred, review_count, next_review_at, ...rest } = value || {}; return [key, rest] })); restoreCurrentSelection() } catch { passages.value = [DEFAULT_PASSAGE]; restoreCurrentSelection() }
     return
   }
   cloudSyncing.value = true
@@ -208,7 +214,7 @@ watch([() => user.value?.id || null, importAttempt], async ([nextUserId]) => {
     if (sentenceError) throw sentenceError
     if (notesError) throw notesError
     lookupCounts.value = Object.fromEntries((cloudNotes || []).map(row => [row.word.trim().toLowerCase(), Number(row.lookup_count) || 0]))
-    const local = JSON.parse(localStorage.getItem(STORE) || '{}')
+    const local = readStorageJson(localStorage, STORE, {})
     const promptKey = `context-reader-import-decided:${nextUser.id}`
     const localSentenceCandidates = (local.passages || []).filter(p => p.id !== 'default' && p.sentence?.trim())
     const localReviewCandidates = Object.values(local.cache || {}).filter(value => value?.llmSuccess && (value.is_starred || (value.review_count || 0) > 0))
@@ -302,7 +308,7 @@ watch([() => user.value?.id || null, importAttempt], async ([nextUserId]) => {
       if (error) { syncNotice.value = '云端同步失败，已保存在本地'; console.error('[Supabase word_notes migration]', error) }
       else {
         const cleanedLocalCache = Object.fromEntries(Object.entries(local.cache || {}).map(([key, value]) => { const { is_starred, review_count, next_review_at, ...rest } = value || {}; return [key, rest] }))
-        localStorage.setItem(STORE, JSON.stringify({ passages: [DEFAULT_PASSAGE], cache: cleanedLocalCache }))
+        writeStorageJson(localStorage, STORE, { passages: [DEFAULT_PASSAGE], cache: cleanedLocalCache })
       }
     }
     // 持久化 UUID 映射，刷新后语料和解析缓存仍使用一致的云端 ID。
@@ -310,7 +316,7 @@ watch([() => user.value?.id || null, importAttempt], async ([nextUserId]) => {
     if (!syncFailed) {
       // 账号云端数据不反写为匿名本地语料，退出登录仍只显示默认句与本地自有句。
       const localCacheNoReview = Object.fromEntries(Object.entries(local.cache || {}).map(([key, value]) => { const { is_starred, review_count, next_review_at, ...rest } = value || {}; return [key, rest] }))
-      localStorage.setItem(STORE, JSON.stringify({ passages: [DEFAULT_PASSAGE], cache: localCacheNoReview }))
+      writeStorageJson(localStorage, STORE, { passages: [DEFAULT_PASSAGE], cache: localCacheNoReview })
       syncNotice.value = ''
     }
     restoreCurrentSelection()
@@ -415,14 +421,6 @@ function openWordBook() {
   loadReviewStats()
   void completeMissingContexts()
 }
-function shuffled(items) {
-  const result = [...items]
-  for (let index = result.length - 1; index > 0; index--) {
-    const swapIndex = Math.floor(Math.random() * (index + 1))
-    ;[result[index], result[swapIndex]] = [result[swapIndex], result[index]]
-  }
-  return result
-}
 function startReview(mode, extra = false) {
   reviewMode.value = mode
   extraPractice.value = extra
@@ -460,25 +458,15 @@ function notifyContextCorpusChanged() {
   contextProcessedWords.clear()
   if (showWordBook.value) void completeMissingContexts()
 }
-function escapeRegExp(value) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-}
-function makeTargetMatcher(word) {
-  return new RegExp(`(?<![A-Za-z])${escapeRegExp(String(word).trim())}(?![A-Za-z])`, 'i')
-}
-function cacheWord(key, value) {
-  const separator = key.indexOf('::')
-  return String(value?.id || value?.text || (separator >= 0 ? key.slice(separator + 2) : key)).trim()
-}
 function updateLocalContextCache(updatedEntries) {
   let local = {}
-  try { local = JSON.parse(localStorage.getItem(STORE) || '{}') } catch { local = {} }
+  local = readStorageJson(localStorage, STORE, {})
   const localCache = { ...(local.cache || {}) }
   for (const [key, value] of updatedEntries) {
     const { is_starred, review_count, next_review_at, ...safeValue } = value
     localCache[key] = safeValue
   }
-  localStorage.setItem(STORE, JSON.stringify({ ...local, cache: localCache }))
+  writeStorageJson(localStorage, STORE, { ...local, cache: localCache })
 }
 async function completeMissingContexts() {
   if (contextCompletionRunning) { contextCompletionPending = true; return }
@@ -524,40 +512,23 @@ async function completeMissingContexts() {
     } while (contextCompletionPending)
   } finally { contextCompletionRunning = false }
 }
-function localDateKey(value) {
-  const date = new Date(value)
-  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
-}
 async function loadReviewStats() {
   if (!supabase || !user.value) return
   const { data, error } = await supabase.from('review_logs').select('word,reviewed_at').eq('user_id', user.value.id).order('reviewed_at', { ascending: false }).limit(10000)
   if (error) { console.error('[Supabase review stats]', error); return }
-  const byDate = new Map()
-  for (const row of data || []) {
-    const day = localDateKey(row.reviewed_at)
-    if (!byDate.has(day)) byDate.set(day, new Set())
-    byDate.get(day).add(row.word.trim().toLowerCase())
-  }
   const today = new Date(); const todayKey = localDateKey(today)
   // 今日进度按 review_logs 记录条数统计，闪卡和填空都会各记一条。
   reviewStats.value.todayCount = (data || []).filter(row => localDateKey(row.reviewed_at) === todayKey).length
-  const cursor = new Date(today.getFullYear(), today.getMonth(), today.getDate())
-  if (!byDate.has(todayKey)) cursor.setDate(cursor.getDate() - 1)
-  let streak = 0
-  while (byDate.has(localDateKey(cursor))) { streak++; cursor.setDate(cursor.getDate() - 1) }
-  reviewStats.value.streakDays = streak
+  reviewStats.value.streakDays = calculateStreakDays(data || [], today)
   // 账号与本地日期共同作为键，确保达标祝贺每天只出现一次。
   const celebrationKey = `context-reader-daily-goal-celebrated:${user.value.id}:${todayKey}`
-  if (reviewStats.value.todayCount >= dailyReviewGoal.value && !localStorage.getItem(celebrationKey)) {
-    localStorage.setItem(celebrationKey, '1')
+  if (reviewStats.value.todayCount >= dailyReviewGoal.value && !readStorage(localStorage, celebrationKey)) {
+    writeStorage(localStorage, celebrationKey, '1')
     goalCelebration.value = true
   }
 }
 function exportStarredCsv() {
-  const quote = value => `"${String(value ?? '').replace(/"/g, '""')}"`
-  const rows = [['单词', '释义', '原句', '复习次数', '下次复习时间']]
-  for (const item of starredNotes.value) rows.push([item.word, item.value.definition, item.value.context_sentence || '', item.value.review_count || 0, item.value.next_review_at || ''])
-  downloadFile('english-context-starred.csv', `\uFEFF${rows.map(row => row.map(quote).join(',')).join('\r\n')}`, 'text/csv;charset=utf-8')
+  downloadFile('english-context-starred.csv', buildStarredNotesCsv(starredNotes.value), 'text/csv;charset=utf-8')
 }
 async function markReviewed(rating, advance = true) {
   if (!reviewCard.value) return
@@ -572,10 +543,8 @@ async function markReviewed(rating, advance = true) {
     return
   }
   const previousCount = value.review_count || 0
-  const count = rating === '认识' ? previousCount + 1 : rating === '不认识' ? 0 : previousCount
-  const days = rating === '认识' ? [1, 2, 4, 7, 15, 30][Math.min(count - 1, 5)] : rating === '模糊' ? 1 : 0
-  const delay = rating === '不认识' ? 10 * 60 * 1000 : days * 86400000
-  const updated = { ...value, review_count: count, next_review_at: new Date(Date.now() + delay).toISOString(), is_starred: true }
+  const { count, nextReviewAt } = calculateReviewSchedule(rating, previousCount)
+  const updated = { ...value, review_count: count, next_review_at: nextReviewAt, is_starred: true }
   cache.value[cacheKey] = updated
   const split = cacheKey.indexOf('::'); const passageId = cacheKey.slice(0, split)
   await saveCloudNote(word.toLowerCase(), passageId, updated)
@@ -589,29 +558,6 @@ async function markReviewed(rating, advance = true) {
   } catch (cause) { console.error('[Supabase review log insert]', cause) }
   if (advance) reviewCard.value = dueReviewNotes.value.find(item => item.cacheKey !== cacheKey) || null
   flippedCard.value = false
-}
-function inflectionForms(word) {
-  const forms = new Set([word])
-  if (word.endsWith('ies') && word.length > 3) forms.add(`${word.slice(0, -3)}y`)
-  if (word.endsWith('ing') && word.length > 4) {
-    const stem = word.slice(0, -3)
-    forms.add(stem); forms.add(`${stem}e`)
-    if (/(.)\1$/.test(stem)) forms.add(stem.slice(0, -1))
-  }
-  if (word.endsWith('ed') && word.length > 3) {
-    const stem = word.slice(0, -2)
-    forms.add(stem); forms.add(`${stem}e`)
-    if (/(.)\1$/.test(stem)) forms.add(stem.slice(0, -1))
-  }
-  if (word.endsWith('es') && word.length > 3) forms.add(word.slice(0, -2))
-  if (word.endsWith('s') && word.length > 2) forms.add(word.slice(0, -1))
-  return forms
-}
-function isInflectionNear(answer, target) {
-  const answerWords = answer.trim().toLowerCase().split(/\s+/)
-  const targetWords = target.trim().toLowerCase().split(/\s+/)
-  if (answerWords.length !== targetWords.length) return false
-  return answerWords.every((word, index) => inflectionForms(word).has(targetWords[index]) || inflectionForms(targetWords[index]).has(word))
 }
 async function submitClozeAnswer() {
   if (!reviewCard.value || clozeAnswered.value) return
@@ -656,20 +602,25 @@ function advanceClozeQuestion() {
   reviewCard.value = clozeRound.value[nextIndex]
 }
 
-async function submitAuth() {
+function openLoginModal() {
+  authError.value = ''; authMessage.value = ''
+  authResetModeVersion.value++
+  showAuth.value = true
+}
+async function submitAuth({ mode, email, password }) {
   if (!supabase) return
   authBusy.value = true; authError.value = ''; authMessage.value = ''
   try {
-    const result = authMode.value === 'login'
-      ? await supabase.auth.signInWithPassword({ email: authEmail.value.trim(), password: authPassword.value })
-      : await supabase.auth.signUp({ email: authEmail.value.trim(), password: authPassword.value })
+    const result = mode === 'login'
+      ? await supabase.auth.signInWithPassword({ email: email.trim(), password })
+      : await supabase.auth.signUp({ email: email.trim(), password })
     if (result.error) throw result.error
-    if (authMode.value === 'register' && !result.data.session) {
+    if (mode === 'register' && !result.data.session) {
       authMessage.value = '注册成功，请检查邮箱并完成验证后登录。'
     } else {
       user.value = result.data.user
       showAuth.value = false
-      authPassword.value = ''
+      authResetPasswordVersion.value++
     }
   } catch (cause) {
     authError.value = cause.message || '认证失败，请检查邮箱和密码后重试。'
@@ -689,20 +640,19 @@ function downloadFile(name, content, type) {
   URL.revokeObjectURL(url)
 }
 function exportBackup() {
-  downloadFile('english-context-backup.json', JSON.stringify({ version: 1, exportedAt: new Date().toISOString(), passages: passages.value, cache: cache.value }, null, 2), 'application/json;charset=utf-8')
+  downloadFile('english-context-backup.json', createBackupJson(passages.value, cache.value), 'application/json;charset=utf-8')
 }
 function importBackup(event) {
   const file = event.target.files?.[0]; if (!file) return
   const reader = new FileReader()
   reader.onload = () => {
     try {
-      const data = JSON.parse(reader.result)
-      if (!Array.isArray(data.passages) || !data.cache || typeof data.cache !== 'object') throw new Error()
-      passages.value = data.passages.filter(p => p?.id && typeof p.sentence === 'string').map(p => ({ ...p, translation: p.translation || '' }))
-      cache.value = Object.fromEntries(Object.entries(data.cache).filter(([, value]) => value?.llmSuccess && value?.deepSchema === 4))
+      const data = parseBackupData(reader.result)
+      passages.value = data.passages
+      cache.value = data.cache
       notifyContextCorpusChanged()
       activePassageId.value = passages.value[0]?.id || ''
-      localStorage.setItem(STORE, JSON.stringify({ passages: passages.value, cache: cache.value }))
+      writeStorageJson(localStorage, STORE, { passages: passages.value, cache: cache.value })
       error.value = ''
     } catch { error.value = '备份文件格式不正确，未导入。' }
     event.target.value = ''
@@ -710,66 +660,22 @@ function importBackup(event) {
   reader.readAsText(file)
 }
 function exportAnki() {
-  const quote = value => `"${String(value ?? '').replace(/"/g, '""')}"`
-  const rows = [['Front', 'Back']]
-  for (const [cacheKey, entry] of Object.entries(cache.value)) {
-    if (!entry?.llmSuccess) continue
-    const split = cacheKey.indexOf('::'); const passageId = cacheKey.slice(0, split)
-    const passage = passages.value.find(p => p.id === passageId)
-    const etymology = entry.etymology
-    const parts = typeof etymology === 'object' ? `词根：${etymology.root || ''}；前缀：${etymology.prefix || ''}；后缀：${etymology.suffix || ''}` : String(etymology || '')
-    const back = [`语境释义：${entry.definition || ''}`, `原始画面：${etymology?.originalImage || ''}`, parts, `所在原句：${passage?.sentence || ''}`, `中文译文：${passage?.translation || ''}`].join('<br>')
-    rows.push([entry.text || cacheKey.slice(split + 2), back])
-  }
-  downloadFile('english-context-anki.csv', `\uFEFF${rows.map(row => row.map(quote).join(',')).join('\r\n')}`, 'text/csv;charset=utf-8')
+  downloadFile('english-context-anki.csv', buildAnkiCsv(cache.value, passages.value), 'text/csv;charset=utf-8')
 }
 
-const normalize = (word) => word.toLowerCase().replace(/^[^a-z'-]+|[^a-z'-]+$/gi, '')
-function isTranslationMissing(value) {
-  const translation = String(value || '').trim()
-  return !translation || ['尚未填写中文翻译', '（尚未填写中文翻译）', '(尚未填写中文翻译)'].includes(translation)
-}
-function splitArticleSentences(text) {
-  const protectedPeriod = '\uE000'
-  const endAwarePeriod = '\uE001'
-  const protectedText = String(text || '')
-    .replace(/\bU\.S\./gi, match => `${match.slice(0, 2).replace(/\./g, protectedPeriod)}${match.slice(2, -1)}${endAwarePeriod}`)
-    .replace(/\b(?:Mr|Mrs|Ms|Dr|Prof|e\.g|i\.e)\./gi, match => match.replace(/\./g, protectedPeriod))
-    .replace(/(\d)\.(?=\d)/g, `$1${protectedPeriod}`)
-    .replace(new RegExp(`${endAwarePeriod}(?=\\s*(?:[\\"“”'’(\\[]*[A-Z0-9]|$))`, 'g'), '.')
-    .replaceAll(endAwarePeriod, protectedPeriod)
-  const parts = protectedText.match(/(?:[^.!?]+[.!?]+["'’”)]*|[^.!?]+$)/g) || []
-  return parts.map(part => part.replaceAll(protectedPeriod, '.').trim()).filter(part => {
-    const words = part.match(/\b[A-Za-z0-9]+(?:['’-][A-Za-z]+)*\b/g) || []
-    return words.length >= 3
-  })
-}
 const fixedPhrases = ['parking space', 'look at']
 const tokens = computed(() => {
   const sentence = activePassage.value?.sentence || ''
-  const words = [...sentence.matchAll(/[A-Za-z]+(?:['’-][A-Za-z]+)*/g)]
-  const result = []; let cursor = 0; let i = 0
-  while (i < words.length) {
-    const current = words[i], next = words[i + 1]
-    const phrase = next && `${normalize(current[0])} ${normalize(next[0])}`
-    // 词组缓存判断也必须限定在当前句子语境内。
-    const phraseKnown = phrase && (fixedPhrases.includes(phrase) || mockMap[phrase] || cache.value[makeCacheKey(activePassage.value.id, phrase)])
-    const start = current.index
-    if (start > cursor) result.push({ text: sentence.slice(cursor, start), key: null })
-    if (phraseKnown) { const end = next.index + next[0].length; result.push({ text: sentence.slice(start, end), key: phrase }); cursor = end; i += 2 }
-    else { const end = start + current[0].length; const word = normalize(current[0]); result.push({ text: current[0], key: word }); cursor = end; i++ }
+  const knownPhrases = new Set(fixedPhrases)
+  for (const phrase of Object.keys(mockMap)) if (phrase.includes(' ')) knownPhrases.add(phrase)
+  for (const key of Object.keys(cache.value)) {
+    const separator = key.indexOf('::')
+    const phrase = key.slice(separator + 2)
+    if (cache.value[key] && separator >= 0 && key.slice(0, separator) === activePassage.value?.id && phrase.includes(' ')) knownPhrases.add(phrase)
   }
-  if (cursor < sentence.length) result.push({ text: sentence.slice(cursor), key: null })
-  return result
+  return tokenizeSentence(sentence, knownPhrases)
 })
 
-function baseForm(word) {
-  if (word.endsWith('ies') && word.length > 4) return `${word.slice(0, -3)}y`
-  if (word.endsWith('ing') && word.length > 5) return word.slice(0, -3).replace(/(.)\1$/, '$1')
-  if (word.endsWith('ed') && word.length > 4) return word.slice(0, -2)
-  if (word.endsWith('s') && word.length > 3 && !word.endsWith('ss')) return word.slice(0, -1)
-  return word
-}
 function placeholder(word) {
   const lemma = baseForm(word); const likelyVerb = /(?:ing|ed)$/.test(word) || ['is', 'are', 'was', 'were', 'has', 'have', 'do', 'does'].includes(word)
   return { id: word, text: word, type: 'word', pronunciation: '点击播放发音', partOfSpeech: likelyVerb ? '可能是动词 / 形容词（需结合语境确认）' : '词性需结合语境确认', definition: `语境占位说明：在“${activePassage.value.sentence}”中，${word} 的具体含义需要结合上下文确认。`, etymology: `原型推断：${lemma}${lemma !== word ? `（从 ${word} 还原的可能原型）` : '（当前词形）'}。此为规则推断，并非词典结论。`, comparisons: [{ word: 'similar', note: '可尝试使用含义相近的表达，具体替换需结合语境。' }, { word: 'related', note: '选择同主题词汇时注意搭配与语气。' }], examples: [{ text: `I noticed “${word}” in this sentence.`, translation: `我在这个句子里注意到了“${word}”。` }, { text: `Can you explain how “${word}” is used here?`, translation: `你能解释“${word}”在这里的用法吗？` }], dynamic: true }
@@ -869,15 +775,9 @@ async function importArticleSentences() {
   if (!selectedSentences.length) { articleImportMessage.value = '请至少勾选一句要导入的句子。'; return }
   if (selectedSentences.length > 50) { articleImportMessage.value = '一次最多导入 50 句，请取消部分勾选后重试。'; return }
 
-  const seen = new Set()
-  const candidates = selectedSentences.filter(sentence => {
-    const key = sentence.trim().toLowerCase()
-    if (seen.has(key)) return false
-    seen.add(key)
-    return true
-  })
+  const candidates = dedupeSentences(selectedSentences, sentence => sentence, true)
   const existing = new Set(passages.value.map(passage => passage.sentence.trim().toLowerCase()))
-  const newCandidates = candidates.filter(sentence => !existing.has(sentence.toLowerCase()))
+  const newCandidates = candidates.filter(sentence => !existing.has(sentenceKey(sentence, value => value, true)))
   let addedPassages = []
 
   if (user.value && supabase && newCandidates.length) {
@@ -895,12 +795,7 @@ async function importArticleSentences() {
     addedPassages = newCandidates.map((sentence, index) => ({ id: `custom-${Date.now()}-${index}`, sentence, translation: '' }))
   }
 
-  const merged = new Map(passages.value.map(passage => [passage.sentence.trim().toLowerCase(), passage]))
-  for (const passage of addedPassages) {
-    const key = passage.sentence.trim().toLowerCase()
-    if (!merged.has(key)) merged.set(key, passage)
-  }
-  passages.value = [...merged.values()]
+  passages.value = mergeSentences(passages.value, addedPassages, passage => passage.sentence, true)
   if (addedPassages.length) activePassageId.value = addedPassages[0].id
   const skipped = selectedSentences.length - addedPassages.length
   articleImportMessage.value = `已导入 ${addedPassages.length} 句，跳过重复 ${skipped} 句。`
@@ -1073,7 +968,7 @@ onBeforeUnmount(() => deleteTimers.forEach(timer => clearTimeout(timer)))
 
 <template>
   <main class="app-shell flex h-screen flex-col overflow-hidden bg-[#f7f6f2] text-[#23241f]">
-    <div v-if="importPrompt" class="mobile-overlay fixed inset-0 z-[70] flex items-center justify-center bg-[#20251f66] p-4"><section class="mobile-dialog w-full max-w-md rounded-2xl bg-white p-6 shadow-2xl"><p class="text-[10px] font-semibold uppercase tracking-[.18em] text-[#8c9284]">Local data found</p><h2 class="mt-2 font-serif text-2xl">导入本地数据？</h2><p class="mt-3 text-sm leading-6 text-[#777970]">此设备上有 <strong>{{ importCounts.sentences }}</strong> 条自定义句子，以及 <strong>{{ importCounts.notes }}</strong> 条带星标或复习进度的词条。是否导入到当前账号？</p><div class="mt-6 flex justify-end gap-2"><button class="rounded-lg border border-[#e8e6df] px-4 py-2 text-sm text-[#62645c]" @click="decideImport(false)">暂不导入</button><button class="rounded-lg bg-[#273b32] px-4 py-2 text-sm text-white" @click="decideImport(true)">导入到账号</button></div></section></div>
+    <ImportConfirmModal :open="importPrompt" :sentence-count="importCounts.sentences" :note-count="importCounts.notes" @import="decideImport(true)" @skip="decideImport(false)" />
     <div v-if="showWordBook" class="mobile-overlay fixed inset-0 z-[55] flex items-center justify-center bg-[#20251f66] p-4" @click.self="showWordBook = false">
       <section class="mobile-dialog wordbook-dialog flex max-h-[85vh] w-full max-w-xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl">
         <header class="flex items-center justify-between gap-3 border-b p-4 sm:p-5">
@@ -1120,7 +1015,7 @@ onBeforeUnmount(() => deleteTimers.forEach(timer => clearTimeout(timer)))
         </div>
       </section>
     </div>
-    <div v-if="showAuth && supabase" class="mobile-overlay fixed inset-0 z-[60] flex items-center justify-center bg-[#20251f66] p-4" @click.self="showAuth = false"><section class="mobile-dialog w-full max-w-sm rounded-2xl bg-white p-6 shadow-2xl"><div class="flex items-start justify-between"><div><p class="text-[10px] font-semibold uppercase tracking-[.18em] text-[#8c9284]">Your reading space</p><h2 class="mt-2 font-serif text-2xl">{{ authMode === 'login' ? '欢迎回来' : '创建账号' }}</h2></div><button class="rounded-full px-2 py-1 text-[#888]" @click="showAuth = false">×</button></div><form class="mt-5 space-y-3" @submit.prevent="submitAuth"><label class="block text-xs font-medium text-[#62645c]">邮箱<input v-model="authEmail" type="email" required autocomplete="email" class="mt-1.5 w-full rounded-lg border border-[#e8e6df] px-3 py-2.5 text-sm outline-none focus:border-[#82917f]" /></label><label class="block text-xs font-medium text-[#62645c]">密码<input v-model="authPassword" type="password" required minlength="6" :autocomplete="authMode === 'login' ? 'current-password' : 'new-password'" class="mt-1.5 w-full rounded-lg border border-[#e8e6df] px-3 py-2.5 text-sm outline-none focus:border-[#82917f]" /></label><p v-if="authError" class="text-xs leading-5 text-[#a45e4f]">{{ authError }}</p><p v-if="authMessage" class="text-xs leading-5 text-[#59765e]">{{ authMessage }}</p><button :disabled="authBusy" class="w-full rounded-lg bg-[#273b32] px-4 py-2.5 text-sm text-white disabled:opacity-60">{{ authBusy ? '请稍候…' : authMode === 'login' ? '登录' : '注册' }}</button></form><button class="mt-4 w-full text-xs text-[#71816f]" @click="authMode = authMode === 'login' ? 'register' : 'login'; authError = ''; authMessage = ''">{{ authMode === 'login' ? '还没有账号？注册' : '已有账号？返回登录' }}</button></section></div>
+    <AuthModal :open="showAuth && !!supabase" :loading="authBusy" :error-message="authError" :message="authMessage" :reset-password-version="authResetPasswordVersion" :reset-mode-version="authResetModeVersion" @submit="submitAuth" @close="showAuth = false" @clear-message="authError = ''; authMessage = ''" />
     <div v-if="showLibrary" class="mobile-overlay fixed inset-0 z-50 flex items-center justify-center bg-[#20251f66] p-4"
       @click.self="showLibrary = false">
       <section class="mobile-dialog wordbook-dialog flex max-h-[85vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl">
@@ -1161,24 +1056,10 @@ onBeforeUnmount(() => deleteTimers.forEach(timer => clearTimeout(timer)))
       <div class="hidden items-center gap-2 text-xs text-[#85877d] sm:flex"><span
           class="h-2 w-2 rounded-full bg-[#87a88d]"></span> A small study space</div><div class="flex flex-wrap items-center justify-end gap-2"><template v-if="user"><span class="max-w-[120px] truncate text-xs text-[#62645c] sm:max-w-[180px]">{{ user.email }}</span><button class="rounded-full border border-[#e5e3dc] bg-white px-3 py-2 text-xs" @click="signOut">退出</button></template>
 
-<button v-else-if="supabase" class="rounded-full border border-[#dce4d8] bg-white px-3 py-2 text-xs text-[#49634e] hover:bg-[#f0f4ed]" @click="authMode = 'login'; authError = ''; authMessage = ''; showAuth = true"><span class="sm:hidden">登录</span><span class="hidden sm:inline">登录 / 注册</span></button><button
+<button v-else-if="supabase" class="rounded-full border border-[#dce4d8] bg-white px-3 py-2 text-xs text-[#49634e] hover:bg-[#f0f4ed]" @click="openLoginModal"><span class="sm:hidden">登录</span><span class="hidden sm:inline">登录 / 注册</span></button><button
         class="rounded-full border border-[#e5e3dc] bg-white px-3 py-2 text-xs" @click="openWordBook"><span class="sm:hidden">⭐ 生词</span><span class="hidden sm:inline">⭐ 生词本</span></button><span v-if="syncNotice" class="hidden text-[10px] text-[#a36b5b] md:inline">{{ syncNotice }}</span><button class="rounded-full border border-[#e5e3dc] bg-white px-4 py-2 text-xs" @click="showSettings = !showSettings">⚙ 设置</button></div>
     </header>
-    <div v-if="showSettings" class="shrink-0 overflow-y-auto border-b border-[#e8e6df] bg-[#f7f6f2] px-5 py-3 md:px-12">
-      <div class="mb-3 flex flex-wrap gap-2"><button class="rounded-full border bg-white px-3 py-2 text-xs" @click="exportBackup">导出备份 JSON</button><button class="rounded-full border bg-white px-3 py-2 text-xs" @click="backupInput?.click()">导入恢复</button><button class="rounded-full border bg-white px-3 py-2 text-xs" @click="exportAnki">导出已学词汇为 Anki CSV</button><input ref="backupInput" type="file" accept="application/json,.json" class="hidden" @change="importBackup" /></div><label class="mb-3 flex min-h-10 items-center gap-2 text-xs text-[#62645c]"><input v-model="defaultBlurTranslation" type="checkbox" class="h-4 w-4 accent-[#49634e]" />默认遮住翻译</label>
-      <div class="rounded-xl border border-[#e8e6df] bg-white p-5"><label class="block text-xs font-medium">每日复习目标</label><select v-model.number="dailyReviewGoal" class="mt-2 min-h-10 w-full rounded-lg border border-[#e8e6df] bg-white px-3 text-sm"><option :value="5">5 个</option><option :value="10">10 个</option><option :value="20">20 个</option><option :value="30">30 个</option></select><label class="mt-4 block text-xs font-medium">Base
-          URL</label><input v-model="apiBaseUrl" type="url" placeholder="https://api.openai.com/v1"
-          class="mt-2 w-full rounded-lg border border-[#e8e6df] px-3 py-2 text-sm outline-none focus:border-[#82917f]" /><label
-          class="mt-4 block text-xs font-medium">Model</label><input v-model="apiModel"
-          placeholder="gpt-4o-mini 或 deepseek-chat"
-          class="mt-2 w-full rounded-lg border border-[#e8e6df] px-3 py-2 text-sm outline-none focus:border-[#82917f]" /><label
-          class="mt-4 block text-xs font-medium">大模型 API Key <span class="text-[#999]">（保存在此浏览器）</span></label><input
-          v-model="apiKey" type="password" autocomplete="off" placeholder="sk-…"
-          class="mt-2 w-full rounded-lg border border-[#e8e6df] px-3 py-2 text-sm outline-none focus:border-[#82917f]" />
-        <p class="mt-2 text-[11px] text-[#92938a]">点击未缓存词语时，通过本地 /api/llm 代理调用上方配置的兼容接口。
-        </p>
-      </div>
-    </div>
+    <SettingsModal :open="showSettings" :default-blur-translation="defaultBlurTranslation" :daily-review-goal="dailyReviewGoal" :api-base-url="apiBaseUrl" :api-model="apiModel" :api-key="apiKey" @close="showSettings = false" @update:defaultBlurTranslation="defaultBlurTranslation = $event" @update:dailyReviewGoal="dailyReviewGoal = $event" @update:apiBaseUrl="apiBaseUrl = $event" @update:apiModel="apiModel = $event" @update:apiKey="apiKey = $event" @export-backup="exportBackup" @import-file="importBackup" @export-anki="exportAnki" />
     <div class="reading-content mx-auto flex min-h-0 w-full flex-1 flex-col px-5 pb-5 pt-3 md:px-8 md:pt-3">
       <div class="mb-4 flex items-end justify-between md:mb-3">
         <div>
