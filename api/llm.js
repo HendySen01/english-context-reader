@@ -13,8 +13,12 @@ export default async function handler(req, res) {
     const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body
     const { baseUrl, model, apiKey, ...payload } = body || {}
 
-    if (!baseUrl || !model || !apiKey || !Array.isArray(payload.messages)) {
-      return res.status(400).json({ error: 'baseUrl, model, apiKey, and messages are required' })
+    const effectiveApiKey = typeof apiKey === 'string' && apiKey.trim()
+      ? apiKey.trim()
+      : process.env.DEEPSEEK_API_KEY
+
+    if (!baseUrl || !model || !effectiveApiKey || !Array.isArray(payload.messages)) {
+      return res.status(400).json({ error: 'baseUrl, model, and messages are required; configure apiKey or DEEPSEEK_API_KEY' })
     }
 
     let base
@@ -33,7 +37,7 @@ export default async function handler(req, res) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
+        Authorization: `Bearer ${effectiveApiKey}`,
       },
       body: JSON.stringify({ ...payload, model }),
     })
