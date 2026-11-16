@@ -17,6 +17,8 @@ let currentUtterance = null
 const showForm = ref(false)
 const showLibrary = ref(false)
 const passageSearch = ref('')
+const pendingDeletes = ref({})
+const deleteTimers = new Map()
 const translating = ref(false)
 const showSettings = ref(false)
 const draftSentence = ref('')
@@ -46,11 +48,15 @@ const showWordBook = ref(false)
 const wordBookFilter = ref('all')
 const flippedCard = ref(false)
 const reviewCard = ref(null)
+const reviewStats = ref({ todayCount: 0, streakDays: 0 })
 const starredNotes = computed(() => Object.entries(cache.value).filter(([, value]) => value?.llmSuccess && value?.is_starred).map(([cacheKey, value]) => ({ cacheKey, value, word: value.text || cacheKey.slice(cacheKey.indexOf('::') + 2) })).filter(item => wordBookFilter.value === 'all' || (wordBookFilter.value === 'due' && (!item.value.next_review_at || new Date(item.value.next_review_at) <= new Date()))))
 const activePassage = computed(() => passages.value.find(p => p.id === activePassageId.value) || passages.value[0])
 // 用稳定句子 id 隔离不同语境下的同一词条解析。
 function makeCacheKey(passageId, key) { return `${passageId}::${key}` }
-const filteredPassages = computed(() => passages.value.filter(p => `${p.sentence} ${p.translation}`.toLowerCase().includes(passageSearch.value.toLowerCase())))
+const availablePassages = computed(() => passages.value.filter(p => !pendingDeletes.value[p.id]))
+const filteredPassages = computed(() => availablePassages.value.filter(p => `${p.sentence} ${p.translation}`.toLowerCase().includes(passageSearch.value.trim().toLowerCase())))
+const activePassageIndex = computed(() => availablePassages.value.findIndex(p => p.id === activePassageId.value))
+const undoDeleteNotice = computed(() => Object.values(pendingDeletes.value).at(-1) || null)
 const sentencePreview = sentence => sentence.trim().split(/\s+/).slice(0, 8).join(' ')
 const mockMap = Object.fromEntries(mockEntries.map(entry => [entry.text.toLowerCase(), entry]))
 // 面板按当前句子与词条共同读取缓存，避免跨句复用解析。
@@ -71,6 +77,7 @@ watch(apiBaseUrl, value => localStorage.setItem('context-reader-base-url', value
 watch(apiModel, value => localStorage.setItem('context-reader-model', value))
 onBeforeUnmount(() => window.speechSynthesis?.cancel())
 onMounted(async () => {
+  if (!supabase) { user.value = null; return }
   const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
     user.value = session?.user || null
   })
@@ -82,7 +89,7 @@ onMounted(async () => {
 onBeforeUnmount(() => authSubscription?.unsubscribe())
 watch([user, importAttempt], async ([nextUser]) => {
   const sequence = ++cloudLoadSequence
-  if (!nextUser) {
+  if (!supabase || !nextUser) {
     if (user.value === null) { /* logout completion */ }
     try { const local = JSON.parse(localStorage.getItem(STORE) || '{}'); passages.value = [DEFAULT_PASSAGE, ...(local.passages || []).filter(p => p.id !== 'default')]; cache.value = Object.fromEntries(Object.entries(local.cache || {}).map(([key, value]) => { const { is_starred, review_count, next_review_at, ...rest } = value || {}; return [key, rest] })); activePassageId.value = passages.value[0].id } catch { passages.value = [DEFAULT_PASSAGE] }
     return
@@ -106,7 +113,7 @@ watch([user, importAttempt], async ([nextUser]) => {
       importCounts.value = { sentences: new Set(localSentenceCandidates.map(p => p.sentence.trim())).size, notes: new Set(localReviewCandidates.map(value => String(value.text || '').trim().toLowerCase()).filter(Boolean)).size }
       passages.value = [DEFAULT_PASSAGE, ...(cloudSentences || []).filter(row => row.english?.trim() !== DEFAULT_PASSAGE.sentence.trim()).map(row => ({ id: row.id, sentence: row.english, translation: row.chinese || '' }))]
       activePassageId.value = passages.value[0].id
-      cache.value = Object.fromEntries((cloudNotes || []).filter(row => row.data?.analysis).map(row => [makeCacheKey(row.data.passageId || passages.value[0].id, row.word), { ...row.data.analysis, id: row.word, is_starred: row.is_starred, review_count: row.review_count, next_review_at: row.next_review_at, llmSuccess: true, deepSchema: 4 }]))
+      cache.value = Object.fromEntries((cloudNotes || []).filter(row => row.data?.analysis).map(row => [makeCacheKey(row.data.passageId || passages.value[0].id, row.word), { ...row.data.analysis, context_sentence: row.data.context_sentence || row.data.analysis.context_sentence, context_translation: row.data.context_translation || row.data.analysis.context_translation, id: row.word, is_starred: row.is_starred, review_count: row.review_count, next_review_at: row.next_review_at, llmSuccess: true, deepSchema: 4 }]))
       importPrompt.value = true
       cloudSyncing.value = false
       return
@@ -150,8 +157,8 @@ watch([user, importAttempt], async ([nextUser]) => {
     const syncedCache = {}
     for (const row of cloudNotes || []) {
       const sentenceId = row.data?.passageId
-      if (sentenceId && row.data?.analysis) syncedCache[makeCacheKey(sentenceId, row.word)] = { ...row.data.analysis, id: row.word, is_starred: row.is_starred, review_count: row.review_count, next_review_at: row.next_review_at, llmSuccess: true, deepSchema: 4 }
-      else if (passages.value[0]) syncedCache[makeCacheKey(passages.value[0].id, row.word)] = { ...(row.data || {}), id: row.word, is_starred: row.is_starred, review_count: row.review_count, next_review_at: row.next_review_at, llmSuccess: true, deepSchema: 4 }
+      if (sentenceId && row.data?.analysis) syncedCache[makeCacheKey(sentenceId, row.word)] = { ...row.data.analysis, context_sentence: row.data.context_sentence || row.data.analysis.context_sentence, context_translation: row.data.context_translation || row.data.analysis.context_translation, id: row.word, is_starred: row.is_starred, review_count: row.review_count, next_review_at: row.next_review_at, llmSuccess: true, deepSchema: 4 }
+      else if (passages.value[0]) syncedCache[makeCacheKey(passages.value[0].id, row.word)] = { ...(row.data?.analysis || row.data || {}), context_sentence: row.data?.context_sentence || row.data?.analysis?.context_sentence, context_translation: row.data?.context_translation || row.data?.analysis?.context_translation, id: row.word, is_starred: row.is_starred, review_count: row.review_count, next_review_at: row.next_review_at, llmSuccess: true, deepSchema: 4 }
     }
     cache.value = syncedCache
     // 登录后把本机已学词条补传到云端，之后以云端数据为准。
@@ -216,7 +223,7 @@ function decideImport(shouldImport) {
 }
 
 async function saveCloudSentence(passage) {
-  if (!user.value || cloudSyncing.value) return
+  if (!supabase || !user.value || cloudSyncing.value) return
   const english = passage.sentence.trim()
   const { error } = await supabase.from('sentences').upsert({ user_id: user.value.id, english, chinese: passage.translation || '' }, { onConflict: 'user_id,english', ignoreDuplicates: true })
   if (error) { console.error('[Supabase sentence save]', error); return }
@@ -234,25 +241,26 @@ async function saveCloudSentence(passage) {
   await saveOrRemapCloudNotes(oldId, data.id)
 }
 async function saveOrRemapCloudNotes(oldId, newId) {
-  if (!user.value) return
+  if (!supabase || !user.value) return
   for (const [key, value] of Object.entries(cache.value)) {
     if (!key.startsWith(`${newId}::`) || !value?.llmSuccess) continue
     await saveCloudNote(key.slice(key.indexOf('::') + 2), newId, value)
   }
 }
 async function deleteCloudSentence(id) {
-  if (!user.value) return
+  if (!supabase || !user.value) return
   const { error } = await supabase.from('sentences').delete().eq('id', id).eq('user_id', user.value.id)
   if (error) console.error('[Supabase sentence delete]', error)
 }
 async function saveCloudNote(word, passageId, value, includeReviewFields = true) {
-  if (!user.value) return
-  const payload = { user_id: user.value.id, word: word.trim().toLowerCase(), data: { passageId, analysis: value }, updated_at: new Date().toISOString() }
+  if (!supabase || !user.value) return
+  const payload = { user_id: user.value.id, word: word.trim().toLowerCase(), data: { passageId, analysis: value, context_sentence: value.context_sentence || null, context_translation: value.context_translation || null }, updated_at: new Date().toISOString() }
   if (includeReviewFields) Object.assign(payload, { is_starred: !!value.is_starred, review_count: value.review_count || 0, next_review_at: value.next_review_at || new Date().toISOString() })
   const { error } = await supabase.from('word_notes').upsert(payload, { onConflict: 'user_id,word' })
   if (error) { syncNotice.value = '云端同步失败，已保存在本地'; console.error('[Supabase word note save]', error) }
 }
 async function toggleStar() {
+  if (!supabase) return
   if (!user.value) { authMessage.value = '请先登录后使用生词本'; showAuth.value = true; return }
   if (loading.value || selected.value?.definition?.includes('语境占位说明')) return
   const cacheKey = makeCacheKey(activePassage.value.id, selectedId.value)
@@ -262,22 +270,63 @@ async function toggleStar() {
   await saveCloudNote(selectedId.value, activePassage.value.id, updated)
 }
 function openWordBook() {
+  if (!supabase) return
   if (!user.value) { authMessage.value = '请先登录后使用生词本'; showAuth.value = true; return }
   showWordBook.value = true
+  loadReviewStats()
+}
+function localDateKey(value) {
+  const date = new Date(value)
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
+}
+async function loadReviewStats() {
+  if (!supabase || !user.value) return
+  const { data, error } = await supabase.from('review_logs').select('word,reviewed_at').eq('user_id', user.value.id).order('reviewed_at', { ascending: false }).limit(10000)
+  if (error) { console.error('[Supabase review stats]', error); return }
+  const byDate = new Map()
+  for (const row of data || []) {
+    const day = localDateKey(row.reviewed_at)
+    if (!byDate.has(day)) byDate.set(day, new Set())
+    byDate.get(day).add(row.word.trim().toLowerCase())
+  }
+  const today = new Date(); const todayKey = localDateKey(today)
+  reviewStats.value.todayCount = byDate.get(todayKey)?.size || 0
+  const cursor = new Date(today.getFullYear(), today.getMonth(), today.getDate())
+  if (!byDate.has(todayKey)) cursor.setDate(cursor.getDate() - 1)
+  let streak = 0
+  while (byDate.has(localDateKey(cursor))) { streak++; cursor.setDate(cursor.getDate() - 1) }
+  reviewStats.value.streakDays = streak
+}
+function exportStarredCsv() {
+  const quote = value => `"${String(value ?? '').replace(/"/g, '""')}"`
+  const rows = [['单词', '释义', '原句', '复习次数', '下次复习时间']]
+  for (const item of starredNotes.value) rows.push([item.word, item.value.definition, item.value.context_sentence || '', item.value.review_count || 0, item.value.next_review_at || ''])
+  downloadFile('english-context-starred.csv', `\uFEFF${rows.map(row => row.map(quote).join(',')).join('\r\n')}`, 'text/csv;charset=utf-8')
 }
 async function markReviewed(rating) {
   if (!reviewCard.value) return
   const { cacheKey, value, word } = reviewCard.value
-  const count = (value.review_count || 0) + 1
-  const days = rating === '熟悉' ? [1, 3, 7, 15][Math.min(count - 1, 3)] : rating === '模糊' ? 1 : 0
-  const updated = { ...value, review_count: count, next_review_at: new Date(Date.now() + days * 86400000).toISOString(), is_starred: true }
+  const previousCount = value.review_count || 0
+  const count = rating === '认识' ? previousCount + 1 : rating === '不认识' ? 0 : previousCount
+  const days = rating === '认识' ? [1, 2, 4, 7, 15, 30][Math.min(count - 1, 5)] : rating === '模糊' ? 1 : 0
+  const delay = rating === '不认识' ? 10 * 60 * 1000 : days * 86400000
+  const updated = { ...value, review_count: count, next_review_at: new Date(Date.now() + delay).toISOString(), is_starred: true }
   cache.value[cacheKey] = updated
   const split = cacheKey.indexOf('::'); const passageId = cacheKey.slice(0, split)
   await saveCloudNote(word.toLowerCase(), passageId, updated)
+  const result = rating === '认识' ? 'know' : rating === '模糊' ? 'vague' : 'unknown'
+  try {
+    if (supabase && user.value) {
+    const { error } = await supabase.from('review_logs').insert({ user_id: user.value.id, word: word.trim().toLowerCase(), result, reviewed_at: new Date().toISOString() })
+    if (error) throw error
+    await loadReviewStats()
+    }
+  } catch (cause) { console.error('[Supabase review log insert]', cause) }
   reviewCard.value = null; flippedCard.value = false
 }
 
 async function submitAuth() {
+  if (!supabase) return
   authBusy.value = true; authError.value = ''; authMessage.value = ''
   try {
     const result = authMode.value === 'login'
@@ -296,6 +345,7 @@ async function submitAuth() {
   } finally { authBusy.value = false }
 }
 async function signOut() {
+  if (!supabase) { user.value = null; return }
   if (user.value?.id) sessionStorage.removeItem(`context-reader-import-decided:${user.value.id}`)
   const { error: signOutError } = await supabase.auth.signOut()
   if (signOutError) authError.value = signOutError.message
@@ -395,7 +445,7 @@ async function fetchWordContext(word, fullSentence) {
       // finish_reason=length 表示模型触及输出上限，直接触发一次重试。
       if (data.choices?.[0]?.finish_reason === 'length') throw new SyntaxError('模型输出达到 token 上限，JSON 可能被截断。')
       // 临时输出原文以定位偶发的格式错误或截断位置。
-      console.log('[LLM 原始返回]', content)
+      // console.log('[LLM 原始返回]', content)
       const cleaned = content.replace(/```(?:json)?\s*/gi, '').replace(/```/g, '').trim()
       const start = cleaned.indexOf('{'); const end = cleaned.lastIndexOf('}')
       const parsed = JSON.parse(start >= 0 && end > start ? cleaned.slice(start, end + 1) : cleaned)
@@ -428,7 +478,7 @@ async function analyze(key) {
     const parsed = await fetchWordContext(key, activePassage.value.sentence)
     // 解析刷新沿用收藏与复习状态，避免覆盖星标数据。
     const previous = cache.value[cacheKey] || {}
-    cache.value[cacheKey] = { ...parsed, id: key, text: parsed.text || key, dynamic: true, llmSuccess: true, deepSchema: 4, is_starred: previous.is_starred || false, review_count: previous.review_count || 0, next_review_at: previous.next_review_at }
+    cache.value[cacheKey] = { ...parsed, id: key, text: parsed.text || key, dynamic: true, llmSuccess: true, deepSchema: 4, context_sentence: activePassage.value.sentence, context_translation: activePassage.value.translation || '', is_starred: previous.is_starred || false, review_count: previous.review_count || 0, next_review_at: previous.next_review_at }
     await saveCloudNote(key, activePassage.value.id, cache.value[cacheKey], false)
   } catch (cause) {
     error.value = '解析请求未成功，当前显示临时说明；点击词语可重试。'
@@ -465,16 +515,57 @@ function playExample(text) {
   utterance.onend = utterance.onerror = () => { if (currentUtterance === utterance) { speakingExample.value = ''; currentUtterance = null } }
   window.speechSynthesis.speak(utterance)
 }
+function navigatePassage(direction) {
+  const list = availablePassages.value
+  if (!list.length) return
+  if (direction === 'random') {
+    const choices = list.filter(p => p.id !== activePassageId.value)
+    const target = choices.length ? choices[Math.floor(Math.random() * choices.length)] : list[0]
+    activePassageId.value = target.id
+    return
+  }
+  const index = Math.max(0, activePassageIndex.value)
+  activePassageId.value = list[(index + direction + list.length) % list.length].id
+}
+function requestDeletePassage(passage) {
+  if (!passage || passage.id === 'default' || pendingDeletes.value[passage.id]) return
+  const previousActiveId = activePassageId.value
+  pendingDeletes.value = { ...pendingDeletes.value, [passage.id]: { passage, previousActiveId } }
+  if (activePassageId.value === passage.id) {
+    const next = availablePassages.value[0]
+    if (next) activePassageId.value = next.id
+  }
+  const timer = setTimeout(async () => {
+    deleteTimers.delete(passage.id)
+    passages.value = passages.value.filter(item => item.id !== passage.id)
+    const cachePrefix = `${passage.id}::`
+    cache.value = Object.fromEntries(Object.entries(cache.value).filter(([key]) => !key.startsWith(cachePrefix)))
+    await deleteCloudSentence(passage.id)
+    const { [passage.id]: _removed, ...remaining } = pendingDeletes.value
+    pendingDeletes.value = remaining
+  }, 5000)
+  deleteTimers.set(passage.id, timer)
+}
+function undoDeletePassage(id) {
+  const pending = pendingDeletes.value[id]
+  if (!pending) return
+  clearTimeout(deleteTimers.get(id)); deleteTimers.delete(id)
+  const { [id]: _removed, ...remaining } = pendingDeletes.value
+  pendingDeletes.value = remaining
+  if (!passages.value.some(item => item.id === id)) passages.value.push(pending.passage)
+  activePassageId.value = pending.previousActiveId === id ? id : activePassageId.value
+}
+onBeforeUnmount(() => deleteTimers.forEach(timer => clearTimeout(timer)))
 </script>
 
 <template>
-  <main class="flex h-screen flex-col overflow-hidden bg-[#f7f6f2] text-[#23241f]">
-    <div v-if="importPrompt" class="fixed inset-0 z-[70] flex items-center justify-center bg-[#20251f66] p-4"><section class="w-full max-w-md rounded-2xl bg-white p-6 shadow-2xl"><p class="text-[10px] font-semibold uppercase tracking-[.18em] text-[#8c9284]">Local data found</p><h2 class="mt-2 font-serif text-2xl">导入本地数据？</h2><p class="mt-3 text-sm leading-6 text-[#777970]">此设备上有 <strong>{{ importCounts.sentences }}</strong> 条自定义句子，以及 <strong>{{ importCounts.notes }}</strong> 条带星标或复习进度的词条。是否导入到当前账号？</p><div class="mt-6 flex justify-end gap-2"><button class="rounded-lg border border-[#e8e6df] px-4 py-2 text-sm text-[#62645c]" @click="decideImport(false)">暂不导入</button><button class="rounded-lg bg-[#273b32] px-4 py-2 text-sm text-white" @click="decideImport(true)">导入到账号</button></div></section></div>
-    <div v-if="showWordBook" class="fixed inset-0 z-[55] flex items-center justify-center bg-[#20251f66] p-4" @click.self="showWordBook = false"><section class="flex max-h-[85vh] w-full max-w-xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl"><header class="flex items-center justify-between border-b p-5"><h2 class="font-serif text-2xl">⭐ 生词本 · {{ starredNotes.length }}</h2><button @click="showWordBook = false">关闭 ×</button></header><div class="flex gap-2 p-4"><button class="rounded-full px-3 py-1.5 text-xs" @click="wordBookFilter = 'all'">全部</button><button class="rounded-full px-3 py-1.5 text-xs" @click="wordBookFilter = 'due'">待复习</button></div><div class="min-h-0 flex-1 overflow-y-auto p-4 pt-0"><div v-if="reviewCard" class="rounded-xl border bg-[#f8f8f4] p-5"><button class="min-h-40 w-full text-left" @click="flippedCard = !flippedCard"><template v-if="!flippedCard"><span>正面 · 点击翻转</span><h3 class="mt-8 font-serif text-3xl">{{ reviewCard.word }}</h3></template><template v-else><span>背面</span><p class="mt-4 text-sm leading-6">{{ reviewCard.value.definition }}</p><p class="mt-3 text-xs">{{ reviewCard.value.etymology?.originalImage }}</p></template></button><div v-if="flippedCard" class="mt-4 grid grid-cols-3 gap-2"><button class="rounded-lg border px-2 py-2 text-xs" @click="markReviewed('熟悉')">认识</button><button class="rounded-lg border px-2 py-2 text-xs" @click="markReviewed('模糊')">模糊</button><button class="rounded-lg border px-2 py-2 text-xs" @click="markReviewed('不认识')">不认识</button></div></div><div v-else-if="starredNotes.length" class="space-y-2"><article v-for="note in starredNotes" :key="note.cacheKey" class="flex items-center gap-3 rounded-xl border p-4"><div class="min-w-0 flex-1"><p class="font-medium">{{ note.word }}</p><p class="mt-1 truncate text-xs text-[#898b82]">{{ note.value.definition }}</p><p class="mt-1 text-[10px]">已复习 {{ note.value.review_count || 0 }} 次</p></div><button class="rounded-lg bg-[#f3f4ef] px-3 py-2 text-xs" @click="reviewCard = note; flippedCard = false">复习</button></article></div><p v-else class="py-12 text-center text-sm text-[#92938a]">暂无星标词条</p></div></section></div>
-    <div v-if="showAuth" class="fixed inset-0 z-[60] flex items-center justify-center bg-[#20251f66] p-4" @click.self="showAuth = false"><section class="w-full max-w-sm rounded-2xl bg-white p-6 shadow-2xl"><div class="flex items-start justify-between"><div><p class="text-[10px] font-semibold uppercase tracking-[.18em] text-[#8c9284]">Your reading space</p><h2 class="mt-2 font-serif text-2xl">{{ authMode === 'login' ? '欢迎回来' : '创建账号' }}</h2></div><button class="rounded-full px-2 py-1 text-[#888]" @click="showAuth = false">×</button></div><form class="mt-5 space-y-3" @submit.prevent="submitAuth"><label class="block text-xs font-medium text-[#62645c]">邮箱<input v-model="authEmail" type="email" required autocomplete="email" class="mt-1.5 w-full rounded-lg border border-[#e8e6df] px-3 py-2.5 text-sm outline-none focus:border-[#82917f]" /></label><label class="block text-xs font-medium text-[#62645c]">密码<input v-model="authPassword" type="password" required minlength="6" :autocomplete="authMode === 'login' ? 'current-password' : 'new-password'" class="mt-1.5 w-full rounded-lg border border-[#e8e6df] px-3 py-2.5 text-sm outline-none focus:border-[#82917f]" /></label><p v-if="authError" class="text-xs leading-5 text-[#a45e4f]">{{ authError }}</p><p v-if="authMessage" class="text-xs leading-5 text-[#59765e]">{{ authMessage }}</p><button :disabled="authBusy" class="w-full rounded-lg bg-[#273b32] px-4 py-2.5 text-sm text-white disabled:opacity-60">{{ authBusy ? '请稍候…' : authMode === 'login' ? '登录' : '注册' }}</button></form><button class="mt-4 w-full text-xs text-[#71816f]" @click="authMode = authMode === 'login' ? 'register' : 'login'; authError = ''; authMessage = ''">{{ authMode === 'login' ? '还没有账号？注册' : '已有账号？返回登录' }}</button></section></div>
-    <div v-if="showLibrary" class="fixed inset-0 z-50 flex items-center justify-center bg-[#20251f66] p-4"
+  <main class="app-shell flex h-screen flex-col overflow-hidden bg-[#f7f6f2] text-[#23241f]">
+    <div v-if="importPrompt" class="mobile-overlay fixed inset-0 z-[70] flex items-center justify-center bg-[#20251f66] p-4"><section class="mobile-dialog w-full max-w-md rounded-2xl bg-white p-6 shadow-2xl"><p class="text-[10px] font-semibold uppercase tracking-[.18em] text-[#8c9284]">Local data found</p><h2 class="mt-2 font-serif text-2xl">导入本地数据？</h2><p class="mt-3 text-sm leading-6 text-[#777970]">此设备上有 <strong>{{ importCounts.sentences }}</strong> 条自定义句子，以及 <strong>{{ importCounts.notes }}</strong> 条带星标或复习进度的词条。是否导入到当前账号？</p><div class="mt-6 flex justify-end gap-2"><button class="rounded-lg border border-[#e8e6df] px-4 py-2 text-sm text-[#62645c]" @click="decideImport(false)">暂不导入</button><button class="rounded-lg bg-[#273b32] px-4 py-2 text-sm text-white" @click="decideImport(true)">导入到账号</button></div></section></div>
+    <div v-if="showWordBook" class="mobile-overlay fixed inset-0 z-[55] flex items-center justify-center bg-[#20251f66] p-4" @click.self="showWordBook = false"><section class="mobile-dialog wordbook-dialog flex max-h-[85vh] w-full max-w-xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl"><header class="flex items-center justify-between border-b p-5"><h2 class="font-serif text-2xl">⭐ 生词本 · {{ starredNotes.length }}</h2><div class="flex items-center gap-2"><button class="min-h-10 rounded-lg border px-3 py-2 text-xs" @click="exportStarredCsv">导出 CSV</button><button class="min-h-10 rounded-lg px-3 py-2 text-sm" @click="showWordBook = false">关闭 ×</button></div></header><div class="px-4 pt-3 text-xs text-[#777970]">今日已复习 {{ reviewStats.todayCount }} 个 · 连续学习 {{ reviewStats.streakDays }} 天</div><div class="flex gap-2 p-4"><button class="min-h-10 rounded-full px-3 py-1.5 text-xs" @click="wordBookFilter = 'all'">全部</button><button class="min-h-10 rounded-full px-3 py-1.5 text-xs" @click="wordBookFilter = 'due'">待复习</button></div><div class="min-h-0 flex-1 overflow-y-auto p-4 pt-0"><div v-if="reviewCard" class="rounded-xl border bg-[#f8f8f4] p-5"><button class="min-h-40 w-full text-left" @click="flippedCard = !flippedCard"><template v-if="!flippedCard"><span>正面 · 点击翻转</span><h3 class="mt-8 font-serif text-3xl">{{ reviewCard.word }}</h3></template><template v-else><span>背面</span><p class="mt-4 text-sm leading-6">{{ reviewCard.value.definition }}</p><p class="mt-3 text-xs">{{ reviewCard.value.etymology?.originalImage }}</p><div v-if="reviewCard.value.context_sentence" class="mt-4 rounded-lg border border-[#e8e6df] bg-white p-3"><p class="text-[10px] uppercase tracking-wide text-[#999]">原句</p><p class="mt-1 text-sm leading-6">{{ reviewCard.value.context_sentence }}</p><p v-if="reviewCard.value.context_translation" class="mt-1 text-xs leading-5 text-[#85877d]">{{ reviewCard.value.context_translation }}</p></div></template></button><div v-if="flippedCard" class="mt-4 grid grid-cols-3 gap-2"><button class="rounded-lg border px-2 py-2 text-xs" @click="markReviewed('熟悉')">认识</button><button class="rounded-lg border px-2 py-2 text-xs" @click="markReviewed('模糊')">模糊</button><button class="rounded-lg border px-2 py-2 text-xs" @click="markReviewed('不认识')">不认识</button></div></div><div v-else-if="starredNotes.length" class="space-y-2"><article v-for="note in starredNotes" :key="note.cacheKey" class="flex items-center gap-3 rounded-xl border p-4"><div class="min-w-0 flex-1"><p class="font-medium">{{ note.word }}</p><p class="mt-1 truncate text-xs text-[#898b82]">{{ note.value.definition }}</p><p class="mt-1 text-[10px]">已复习 {{ note.value.review_count || 0 }} 次</p></div><button class="rounded-lg bg-[#f3f4ef] px-3 py-2 text-xs" @click="reviewCard = note; flippedCard = false">复习</button></article></div><p v-else class="py-12 text-center text-sm text-[#92938a]">暂无星标词条</p></div></section></div>
+    <div v-if="showAuth && supabase" class="mobile-overlay fixed inset-0 z-[60] flex items-center justify-center bg-[#20251f66] p-4" @click.self="showAuth = false"><section class="mobile-dialog w-full max-w-sm rounded-2xl bg-white p-6 shadow-2xl"><div class="flex items-start justify-between"><div><p class="text-[10px] font-semibold uppercase tracking-[.18em] text-[#8c9284]">Your reading space</p><h2 class="mt-2 font-serif text-2xl">{{ authMode === 'login' ? '欢迎回来' : '创建账号' }}</h2></div><button class="rounded-full px-2 py-1 text-[#888]" @click="showAuth = false">×</button></div><form class="mt-5 space-y-3" @submit.prevent="submitAuth"><label class="block text-xs font-medium text-[#62645c]">邮箱<input v-model="authEmail" type="email" required autocomplete="email" class="mt-1.5 w-full rounded-lg border border-[#e8e6df] px-3 py-2.5 text-sm outline-none focus:border-[#82917f]" /></label><label class="block text-xs font-medium text-[#62645c]">密码<input v-model="authPassword" type="password" required minlength="6" :autocomplete="authMode === 'login' ? 'current-password' : 'new-password'" class="mt-1.5 w-full rounded-lg border border-[#e8e6df] px-3 py-2.5 text-sm outline-none focus:border-[#82917f]" /></label><p v-if="authError" class="text-xs leading-5 text-[#a45e4f]">{{ authError }}</p><p v-if="authMessage" class="text-xs leading-5 text-[#59765e]">{{ authMessage }}</p><button :disabled="authBusy" class="w-full rounded-lg bg-[#273b32] px-4 py-2.5 text-sm text-white disabled:opacity-60">{{ authBusy ? '请稍候…' : authMode === 'login' ? '登录' : '注册' }}</button></form><button class="mt-4 w-full text-xs text-[#71816f]" @click="authMode = authMode === 'login' ? 'register' : 'login'; authError = ''; authMessage = ''">{{ authMode === 'login' ? '还没有账号？注册' : '已有账号？返回登录' }}</button></section></div>
+    <div v-if="showLibrary" class="mobile-overlay fixed inset-0 z-50 flex items-center justify-center bg-[#20251f66] p-4"
       @click.self="showLibrary = false">
-      <section class="flex max-h-[85vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl">
+      <section class="mobile-dialog wordbook-dialog flex max-h-[85vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl">
         <header class="flex items-center justify-between border-b border-[#eeece6] p-5">
           <div>
             <h2 class="font-serif text-2xl">语料句子库</h2>
@@ -492,20 +583,21 @@ function playExample(text) {
                   v-if="passage.sentence.trim().split(/\s+/).length > 8">…</span></p>
               <p class="mt-1.5 text-xs leading-5 text-[#92938a]">{{ passage.translation }}</p>
             </div><button v-if="passage.id !== 'default'" class="self-start rounded-md px-2 py-1 text-xs text-[#a36b5b]"
-              @click.stop="passages = passages.filter(item => item.id !== passage.id); if (activePassageId === passage.id) activePassageId = passages[0]?.id || ''">删除</button>
+              @click.stop="requestDeletePassage(passage)">删除</button>
           </article>
           <p v-if="!filteredPassages.length" class="py-8 text-center text-sm text-[#999]">没有匹配的句子</p>
         </div>
       </section>
     </div>
-    <header class="flex h-[76px] items-center justify-between border-b border-[#e7e5df] px-6 md:px-12"><a
+    <div v-if="undoDeleteNotice" class="fixed bottom-5 left-1/2 z-[65] flex -translate-x-1/2 items-center gap-4 rounded-xl bg-[#273b32] px-4 py-3 text-sm text-white shadow-lg"><span>已删除</span><button class="font-semibold underline underline-offset-2" @click="undoDeletePassage(undoDeleteNotice.passage.id)">撤销</button></div>
+    <header class="flex min-h-[68px] flex-wrap items-center justify-between gap-y-2 border-b border-[#e7e5df] px-4 py-2 md:h-[76px] md:flex-nowrap md:px-12 md:py-0"><a
         class="flex items-center gap-3" href="#"><span
           class="grid h-9 w-9 place-items-center rounded-xl bg-[#273b32] text-sm font-semibold text-white">C.</span><span
           class="text-[15px] font-semibold tracking-tight">context<span class="text-[#9a9c91]"> /
             reader</span></span></a>
       <div class="hidden items-center gap-2 text-xs text-[#85877d] sm:flex"><span
-          class="h-2 w-2 rounded-full bg-[#87a88d]"></span> A small study space</div><div class="flex items-center gap-2"><template v-if="user"><span class="hidden max-w-[180px] truncate text-xs text-[#62645c] sm:inline">{{ user.email }}</span><button class="rounded-full border border-[#e5e3dc] bg-white px-3 py-2 text-xs" @click="signOut">退出</button></template><button v-else class="rounded-full border border-[#dce4d8] bg-white px-3 py-2 text-xs text-[#49634e] hover:bg-[#f0f4ed]" @click="authMode = 'login'; authError = ''; authMessage = ''; showAuth = true">登录 / 注册</button><button
-        class="rounded-full border border-[#e5e3dc] bg-white px-3 py-2 text-xs" @click="openWordBook">⭐ 生词本</button><span v-if="syncNotice" class="hidden text-[10px] text-[#a36b5b] md:inline">{{ syncNotice }}</span><button class="rounded-full border border-[#e5e3dc] bg-white px-4 py-2 text-xs" @click="showSettings = !showSettings">⚙ 设置</button></div>
+          class="h-2 w-2 rounded-full bg-[#87a88d]"></span> A small study space</div><div class="flex flex-wrap items-center justify-end gap-2"><template v-if="user"><span class="max-w-[120px] truncate text-xs text-[#62645c] sm:max-w-[180px]">{{ user.email }}</span><button class="rounded-full border border-[#e5e3dc] bg-white px-3 py-2 text-xs" @click="signOut">退出</button></template><button v-else-if="supabase" class="rounded-full border border-[#dce4d8] bg-white px-3 py-2 text-xs text-[#49634e] hover:bg-[#f0f4ed]" @click="authMode = 'login'; authError = ''; authMessage = ''; showAuth = true"><span class="sm:hidden">登录</span><span class="hidden sm:inline">登录 / 注册</span></button><button
+        class="rounded-full border border-[#e5e3dc] bg-white px-3 py-2 text-xs" @click="openWordBook"><span class="sm:hidden">⭐ 生词</span><span class="hidden sm:inline">⭐ 生词本</span></button><span v-if="syncNotice" class="hidden text-[10px] text-[#a36b5b] md:inline">{{ syncNotice }}</span><button class="rounded-full border border-[#e5e3dc] bg-white px-4 py-2 text-xs" @click="showSettings = !showSettings">⚙ 设置</button></div>
     </header>
     <div v-if="showSettings" class="shrink-0 overflow-y-auto border-b border-[#e8e6df] bg-[#f7f6f2] px-5 py-3 md:px-12">
       <div class="mb-3 flex flex-wrap gap-2"><button class="rounded-full border bg-white px-3 py-2 text-xs" @click="exportBackup">导出备份 JSON</button><button class="rounded-full border bg-white px-3 py-2 text-xs" @click="backupInput?.click()">导入恢复</button><button class="rounded-full border bg-white px-3 py-2 text-xs" @click="exportAnki">导出已学词汇为 Anki CSV</button><input ref="backupInput" type="file" accept="application/json,.json" class="hidden" @change="importBackup" /></div>
@@ -534,17 +626,18 @@ function playExample(text) {
         <div class="hidden text-right text-xs text-[#9a9b92] md:block">A short passage<br />Every word has a place</div>
       </div>
       <section
-        class="grid min-h-0 flex-1 grid-cols-1 grid-rows-[minmax(38%,0.9fr)_minmax(0,1.1fr)] overflow-hidden rounded-2xl border border-[#e8e6df] bg-white shadow-[0_12px_40px_rgba(43,48,38,.035)] lg:grid-rows-1 lg:grid-cols-[1.02fr_.98fr]">
+        class="reading-layout grid min-h-0 flex-1 grid-cols-1 grid-rows-[minmax(38%,0.9fr)_minmax(0,1.1fr)] overflow-hidden rounded-2xl border border-[#e8e6df] bg-white shadow-[0_12px_40px_rgba(43,48,38,.035)] lg:grid-rows-1 lg:grid-cols-[1.02fr_.98fr]">
         <div
-          class="flex min-h-0 flex-col overflow-y-auto border-b border-[#eeece6] p-4 md:p-8 lg:border-b-0 lg:border-r lg:p-10">
+          class="reading-pane flex min-h-0 flex-col overflow-y-auto border-b border-[#eeece6] p-4 md:p-8 lg:border-b-0 lg:border-r lg:p-10">
           <div class="flex items-center justify-between"><span
               class="text-[10px] font-semibold uppercase tracking-[.18em] text-[#9a9b91]">The passage</span>
             <div class="flex items-center gap-2"><button
                 class="rounded-full border border-[#e9e8e1] bg-white px-3 py-1.5 text-[10px] text-[#62645c]"
-                @click="showLibrary = true">语料库 · {{ passages.length }}</button><button
+                @click="showLibrary = true">语料库 · {{ availablePassages.length }}</button><button
                 class="rounded-full bg-[#273b32] px-3 py-1.5 text-[10px] text-white hover:bg-[#385344]"
                 @click="showForm = !showForm">+ 新增句子</button></div>
           </div>
+          <div class="mt-3 flex items-center gap-2"><button class="rounded-full border border-[#e9e8e1] px-3 py-1.5 text-[10px] text-[#62645c] disabled:opacity-40" :disabled="availablePassages.length < 2" @click="navigatePassage(-1)">← 上一句</button><button class="rounded-full border border-[#e9e8e1] px-3 py-1.5 text-[10px] text-[#62645c] disabled:opacity-40" :disabled="availablePassages.length < 2" @click="navigatePassage(1)">下一句 →</button><button class="ml-auto rounded-full bg-[#f3f4ef] px-3 py-1.5 text-[10px] text-[#526b55] disabled:opacity-40" :disabled="availablePassages.length < 2" @click="navigatePassage('random')">随机一句 ⤨</button></div>
           <form v-if="showForm" class="mt-5 space-y-2 rounded-xl bg-[#f7f7f3] p-4" @submit.prevent="addPassage">
             <textarea v-model="draftSentence" required rows="2" placeholder="输入英文句子"
               class="w-full resize-y rounded-lg border border-[#e8e6df] bg-white p-3 text-sm outline-none focus:border-[#82917f]"></textarea><input
@@ -556,7 +649,7 @@ function playExample(text) {
                 '正在生成译文…' : '添加并解析' }}</button></div>
           </form>
           <div
-            class="my-auto py-14 font-serif text-[27px] leading-[2.15] tracking-[-.02em] text-[#35372f] md:text-[32px]">
+            class="sentence-display my-auto py-14 font-serif text-[27px] leading-[2.15] tracking-[-.02em] text-[#35372f] md:text-[32px]">
             <template v-for="(token, index) in tokens" :key="index"><button v-if="token.key" class="interactive-word"
                 :class="{ 'active-word': selectedId === token.key }" @click="analyze(token.key)">{{ token.text
                 }}</button><span v-else>{{ token.text }}</span></template>
@@ -566,7 +659,7 @@ function playExample(text) {
             <p class="mt-2 text-[10px] text-[#b0b1a8]">↗ 点击高亮词语，查看语境中的解析</p>
           </div>
         </div>
-        <div class="min-h-0 overflow-y-auto overscroll-contain">
+        <div class="notes-pane min-h-0 overflow-y-auto overscroll-contain">
           <Transition name="panel" mode="out-in">
             <article v-if="selected" :key="selected.id" class="p-6 md:p-10">
               <div class="flex items-center justify-between"><span
