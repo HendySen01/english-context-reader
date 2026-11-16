@@ -4,9 +4,8 @@
 
 在线演示：<https://english-context-reader.vercel.app>
 
-![image-20261116180012688](C:/Users/Administrator/AppData/Roaming/Typora/typora-user-images/image-20261116180012688.png)
-
-![image-20261116180044940](C:/Users/Administrator/AppData/Roaming/Typora/typora-user-images/image-20261116180044940.png)
+![介面預覽1](./images/image-20261116180012688.png)
+![介面預覽2](./images/image-20261116180044940.png)
 
 
 
