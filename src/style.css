@@ -6,19 +6,31 @@
 :root { font-family: 'DM Sans', 'Microsoft YaHei', sans-serif; font-synthesis: none; text-rendering: optimizeLegibility; }
 body { margin: 0; min-width: 360px; }
 button { cursor: pointer; }
+.reading-content { width: min(100%, 1400px); max-width: min(1400px, 94vw); }
+.notes-pane { scrollbar-width: thin; scrollbar-color: #c7cec2 transparent; }
+.notes-pane::-webkit-scrollbar { width: 6px; }
+.notes-pane::-webkit-scrollbar-track { background: transparent; }
+.notes-pane::-webkit-scrollbar-thumb { border-radius: 999px; background: #c7cec2; }
+@media (min-width: 768px) {
+  .reading-layout { height: max(560px, calc(100vh - 76px - 32px - 148px)); flex: none; }
+  .reading-pane { overflow: hidden; }
+}
 @media (max-width: 400px) {
   button { min-height: 40px; }
   .interactive-word { display: inline-flex; align-items: center; }
   .fixed > section { width: min(100%, calc(100vw - 2rem)); max-height: 85dvh; }
 }
-@media (max-width: 639px) {
+@media (max-width: 767px) {
   html, body, #app { width: 100%; min-width: 0; }
   .app-shell { height: auto; min-height: 100dvh; overflow: visible; }
-  .reading-content { flex: none; min-height: auto; overflow: visible; padding: 1.25rem 1rem 1.5rem; }
+  .reading-content { flex: none; min-height: auto; max-width: none; width: 100%; overflow: visible; padding: 1rem 12px 1.5rem; }
   .reading-layout { display: flex; flex: none; flex-direction: column; min-height: 0; overflow: visible; }
-  .reading-pane { min-height: auto; overflow: visible; padding: 1rem; }
+  .reading-pane { min-height: auto; height: auto; overflow: visible; padding: 1rem; }
   .notes-pane { min-height: auto; overflow: visible; overscroll-behavior: auto; }
-  .sentence-display { margin-top: 0; margin-bottom: 0; padding: 2rem 0; font-size: clamp(24px, 7vw, 28px); line-height: 1.9; }
+  .sentence-display { margin-top: 0; margin-bottom: 0; padding: 2rem 0; font-size: clamp(24px, 3vw, 40px); line-height: 1.9; }
+  .passage-toolbar { align-items: flex-start; }
+  .passage-toolbar > div { max-width: 100%; }
+  .passage-toolbar button { min-height: 40px; }
   .interactive-word { display: inline-flex; min-height: 40px; align-items: center; vertical-align: middle; }
   button { min-height: 40px; }
   .mobile-overlay { padding: 4vw; }

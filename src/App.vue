@@ -63,6 +63,9 @@ const importDecisionUser = ref('')
 const showWordBook = ref(false)
 const wordBookView = ref('list')
 const reviewMode = ref('flashcard')
+const extraPractice = ref(false)
+const practiceRound = ref([])
+const practiceIndex = ref(0)
 const wordBookFilter = ref('all')
 const wordBookSort = ref('due')
 const lookupCounts = ref({})
@@ -98,7 +101,15 @@ const dueReviewNotes = computed(() => Object.entries(cache.value)
   .filter(([, value]) => value?.llmSuccess && value?.is_starred && (!value.next_review_at || new Date(value.next_review_at) <= new Date()))
   .map(([cacheKey, value]) => ({ cacheKey, value, word: value.text || cacheKey.slice(cacheKey.indexOf('::') + 2) }))
   .sort((a, b) => new Date(a.value.next_review_at || 0) - new Date(b.value.next_review_at || 0)))
+const allStarredNotes = computed(() => Object.entries(cache.value)
+  .filter(([, value]) => value?.llmSuccess && value?.is_starred)
+  .map(([cacheKey, value]) => ({ cacheKey, value, word: value.text || cacheKey.slice(cacheKey.indexOf('::') + 2) })))
 const clozeReviewNotes = computed(() => dueReviewNotes.value.filter(note => {
+  const sentence = String(note.value.context_sentence || '').trim()
+  if (!sentence) return false
+  try { return makeTargetMatcher(note.word).test(sentence) } catch { return false }
+}))
+const allClozeNotes = computed(() => allStarredNotes.value.filter(note => {
   const sentence = String(note.value.context_sentence || '').trim()
   if (!sentence) return false
   try { return makeTargetMatcher(note.word).test(sentence) } catch { return false }
@@ -122,6 +133,8 @@ function restoreCurrentSelection(markReady = true) {
   selectionReady.value = markReady
 }
 const availablePassages = computed(() => passages.value.filter(p => !pendingDeletes.value[p.id]))
+const missingTranslationPassages = computed(() => availablePassages.value.filter(passage => isTranslationMissing(passage.translation)))
+const failedTranslationCount = computed(() => translationFailed.value.filter(key => availablePassages.value.some(passage => passage.sentence.trim().toLowerCase() === key)).length)
 const filteredPassages = computed(() => availablePassages.value.filter(p => `${p.sentence} ${p.translation}`.toLowerCase().includes(passageSearch.value.trim().toLowerCase())))
 const articleSentences = computed(() => splitArticleSentences(articleText.value))
 const checkedArticleSentences = computed(() => articleSentences.value.filter((_, index) => articleChecks.value[index] !== false))
@@ -402,7 +415,17 @@ function openWordBook() {
   loadReviewStats()
   void completeMissingContexts()
 }
-function startReview() {
+function shuffled(items) {
+  const result = [...items]
+  for (let index = result.length - 1; index > 0; index--) {
+    const swapIndex = Math.floor(Math.random() * (index + 1))
+    ;[result[index], result[swapIndex]] = [result[swapIndex], result[index]]
+  }
+  return result
+}
+function startReview(mode, extra = false) {
+  reviewMode.value = mode
+  extraPractice.value = extra
   wordBookView.value = 'review'
   flippedCard.value = false
   clozeInput.value = ''
@@ -411,24 +434,27 @@ function startReview() {
   clozeWasCorrect.value = false
   clozeCorrectCount.value = 0
   clozeRoundFinished.value = false
-  if (reviewMode.value === 'cloze') {
-    clozeRound.value = [...clozeReviewNotes.value]
+  const source = extra
+    ? (mode === 'cloze' ? allClozeNotes.value : allStarredNotes.value)
+    : (mode === 'cloze' ? clozeReviewNotes.value : dueReviewNotes.value)
+  const items = extra ? shuffled(source) : [...source]
+  practiceRound.value = mode === 'flashcard' ? items : []
+  practiceIndex.value = 0
+  if (mode === 'cloze') {
+    clozeRound.value = items
     clozeIndex.value = 0
     reviewCard.value = clozeRound.value[0] || null
   } else {
     clozeRound.value = []
     clozeIndex.value = 0
-    reviewCard.value = dueReviewNotes.value[0] || null
+    reviewCard.value = practiceRound.value[0] || null
   }
-}
-function selectReviewMode(mode) {
-  reviewMode.value = mode
-  if (wordBookView.value === 'review') startReview()
 }
 function returnToWordBookList() {
   wordBookView.value = 'list'
   reviewCard.value = null
   flippedCard.value = false
+  extraPractice.value = false
 }
 function notifyContextCorpusChanged() {
   contextProcessedWords.clear()
@@ -536,6 +562,15 @@ function exportStarredCsv() {
 async function markReviewed(rating, advance = true) {
   if (!reviewCard.value) return
   const { cacheKey, value, word } = reviewCard.value
+  // 加练只浏览并反馈，不改变复习计划或写入复习日志。
+  if (extraPractice.value) {
+    if (advance && reviewMode.value === 'flashcard') {
+      practiceIndex.value++
+      reviewCard.value = practiceRound.value[practiceIndex.value] || null
+    }
+    flippedCard.value = false
+    return
+  }
   const previousCount = value.review_count || 0
   const count = rating === '认识' ? previousCount + 1 : rating === '不认识' ? 0 : previousCount
   const days = rating === '认识' ? [1, 2, 4, 7, 15, 30][Math.min(count - 1, 5)] : rating === '模糊' ? 1 : 0
@@ -890,7 +925,10 @@ function enqueueSentenceTranslations(passagesToTranslate) {
   void processTranslationQueue()
 }
 function supplementTranslations() {
-  enqueueSentenceTranslations(availablePassages.value.filter(passage => isTranslationMissing(passage.translation)))
+  enqueueSentenceTranslations(missingTranslationPassages.value)
+}
+function translateActivePassage() {
+  if (activePassage.value && isTranslationMissing(activePassage.value.translation)) enqueueSentenceTranslations([activePassage.value])
 }
 function retryFailedTranslations() {
   const failedKeys = [...translationFailed.value]
@@ -1048,11 +1086,18 @@ onBeforeUnmount(() => deleteTimers.forEach(timer => clearTimeout(timer)))
           <p v-if="goalCelebration" class="mt-2 text-xs font-medium text-[#59765e]">🎉 今日复习目标已完成，做得好！</p>
           <p class="mt-1 text-[10px] text-[#999b91]">今日已复习 {{ reviewStats.todayCount }} 次</p>
         </div>
-        <div class="flex gap-2 px-4 pt-3"><button class="min-h-10 rounded-full px-3 py-1.5 text-xs" :class="reviewMode === 'flashcard' ? 'bg-[#273b32] text-white' : 'bg-[#f3f4ef] text-[#62645c]'" @click="selectReviewMode('flashcard')">闪卡</button><button class="min-h-10 rounded-full px-3 py-1.5 text-xs" :class="reviewMode === 'cloze' ? 'bg-[#273b32] text-white' : 'bg-[#f3f4ef] text-[#62645c]'" @click="selectReviewMode('cloze')">填空</button></div>
         <div v-if="wordBookView === 'list'" class="flex flex-wrap items-center gap-2 p-4">
           <button class="min-h-10 rounded-full px-3 py-1.5 text-xs" @click="wordBookFilter = 'all'">全部</button><button class="min-h-10 rounded-full px-3 py-1.5 text-xs" @click="wordBookFilter = 'due'">待复习</button>
           <label class="flex items-center gap-2 text-xs text-[#777970]">排序<select v-model="wordBookSort" class="min-h-10 rounded-lg border border-[#e8e6df] bg-white px-2"><option value="due">按到期时间</option><option value="lookup">按查询次数（多的在前）</option></select></label>
-          <button class="min-h-10 rounded-full bg-[#273b32] px-3 py-2 text-xs text-white sm:ml-auto" @click="startReview">开始复习 · {{ reviewMode === 'cloze' ? clozeReviewNotes.length : dueReviewNotes.length }}</button>
+          <div class="flex w-full flex-wrap gap-2 pt-1">
+            <button class="min-h-10 rounded-full bg-[#273b32] px-4 py-2 text-xs text-white disabled:cursor-not-allowed disabled:bg-[#e8e8e2] disabled:text-[#999] sm:ml-auto" :disabled="dueReviewNotes.length === 0" @click="startReview('flashcard')">闪卡复习 · {{ dueReviewNotes.length }}</button>
+            <button class="min-h-10 rounded-full bg-[#526b55] px-4 py-2 text-xs text-white disabled:cursor-not-allowed disabled:bg-[#e8e8e2] disabled:text-[#999]" :disabled="clozeReviewNotes.length === 0" @click="startReview('cloze')">填空练习 · {{ clozeReviewNotes.length }}</button>
+          </div>
+          <div v-if="dueReviewNotes.length === 0 && clozeReviewNotes.length === 0" class="w-full border-t border-[#eeece6] pt-3 text-center">
+            <p class="text-xs text-[#92938a]">现在没有到期的词，下次复习时间由你的反馈决定</p>
+            <p class="mt-3 text-[11px] font-medium text-[#777970]">加练：练习全部星标词</p>
+            <div class="mt-2 flex justify-center gap-2"><button class="min-h-10 rounded-full border border-[#dce4d8] px-4 py-2 text-xs text-[#49634e] disabled:opacity-40" :disabled="allStarredNotes.length === 0" @click="startReview('flashcard', true)">闪卡加练 · {{ allStarredNotes.length }}</button><button class="min-h-10 rounded-full border border-[#dce4d8] px-4 py-2 text-xs text-[#49634e] disabled:opacity-40" :disabled="allClozeNotes.length === 0" @click="startReview('cloze', true)">填空加练 · {{ allClozeNotes.length }}</button></div>
+          </div>
         </div>
         <div class="min-h-0 flex-1 overflow-y-auto p-4 pt-0">
           <template v-if="wordBookView === 'list'">
@@ -1061,6 +1106,7 @@ onBeforeUnmount(() => deleteTimers.forEach(timer => clearTimeout(timer)))
           </template>
           <div v-else class="space-y-4">
             <button class="min-h-10 rounded-lg px-2 py-2 text-xs text-[#526b55]" @click="returnToWordBookList">← 返回列表</button>
+            <p v-if="extraPractice" class="rounded-lg bg-[#f2f4ee] px-3 py-2 text-xs text-[#667661]">加练模式，不影响复习计划</p>
             <template v-if="reviewMode === 'flashcard'">
               <div v-if="reviewCard" class="rounded-xl border bg-[#f8f8f4] p-5"><button class="min-h-40 w-full text-left" @click="flippedCard = !flippedCard"><template v-if="!flippedCard"><span>正面 · 点击翻转</span><h3 class="mt-8 font-serif text-3xl">{{ reviewCard.word }}</h3></template><template v-else><span>背面</span><p class="mt-4 text-sm leading-6">{{ reviewCard.value.definition }}</p><p class="mt-3 text-xs">{{ reviewCard.value.etymology?.originalImage }}</p><div v-if="reviewCard.value.context_sentence" class="mt-4 rounded-lg border border-[#e8e6df] bg-white p-3"><p class="text-[10px] uppercase tracking-wide text-[#999]">原句</p><p class="mt-1 text-sm leading-6">{{ reviewCard.value.context_sentence }}</p><p v-if="reviewCard.value.context_translation" class="mt-1 text-xs leading-5 text-[#85877d]">{{ reviewCard.value.context_translation }}</p></div></template></button><div v-if="flippedCard" class="mt-4 grid grid-cols-3 gap-2"><button class="min-h-10 rounded-lg border px-2 py-2 text-xs" @click="markReviewed('认识')">认识</button><button class="min-h-10 rounded-lg border px-2 py-2 text-xs" @click="markReviewed('模糊')">模糊</button><button class="min-h-10 rounded-lg border px-2 py-2 text-xs" @click="markReviewed('不认识')">不认识</button></div></div>
               <p v-else class="rounded-xl bg-[#f8f8f4] py-12 text-center text-sm text-[#92938a]">今天没有需要复习的词</p>
@@ -1086,6 +1132,11 @@ onBeforeUnmount(() => deleteTimers.forEach(timer => clearTimeout(timer)))
         </header>
         <div class="p-4"><input v-model="passageSearch" placeholder="搜索英文句子或中文翻译"
             class="w-full rounded-lg border border-[#e8e6df] px-3 py-2 text-sm" /></div>
+        <div v-if="missingTranslationPassages.length || translationProgress.running || failedTranslationCount" class="flex flex-wrap items-center gap-x-2 gap-y-1 border-b border-[#eeece6] px-4 pb-3 text-xs">
+          <button v-if="missingTranslationPassages.length" class="min-h-10 rounded-full bg-[#f0f4ed] px-3 py-2 font-medium text-[#49634e]" @click="supplementTranslations">{{ missingTranslationPassages.length }} 句缺翻译 · 全部补全</button>
+          <span v-if="translationProgress.running" class="text-[#82917f]">翻译中 {{ translationProgress.completed }} / {{ translationProgress.total }}</span>
+          <template v-if="failedTranslationCount"><span class="text-[#a36b5b]">有 {{ failedTranslationCount }} 句翻译失败</span><button class="min-h-10 px-1 text-[#49634e] underline underline-offset-2" @click="retryFailedTranslations">重新翻译</button></template>
+        </div>
         <div class="min-h-0 flex-1 space-y-2 overflow-y-auto px-4 pb-4">
           <article v-for="passage in filteredPassages" :key="passage.id" class="flex gap-3 rounded-xl border p-4"
             :class="activePassageId === passage.id ? 'border-[#9bad96] bg-[#f4f6f1]' : 'border-[#eeece6]'"
@@ -1128,21 +1179,21 @@ onBeforeUnmount(() => deleteTimers.forEach(timer => clearTimeout(timer)))
         </p>
       </div>
     </div>
-    <div class="mx-auto flex min-h-0 w-full max-w-[1440px] flex-1 flex-col px-5 pb-5 pt-5 md:px-12 md:pt-6">
-      <div class="mb-9 flex items-end justify-between">
+    <div class="reading-content mx-auto flex min-h-0 w-full flex-1 flex-col px-5 pb-5 pt-3 md:px-8 md:pt-3">
+      <div class="mb-4 flex items-end justify-between md:mb-3">
         <div>
-          <div class="mb-3 text-[10px] font-semibold uppercase tracking-[.22em] text-[#8c9284]">Reading in context <span
+          <div class="mb-1.5 text-[10px] font-semibold uppercase tracking-[.22em] text-[#8c9284]">Reading in context <span
               class="px-1">·</span> 01</div>
-          <h1 class="font-serif text-3xl tracking-[-.04em] md:text-[40px]">Words make sense <span
+          <h1 class="font-serif text-[26px] tracking-[-.04em] md:text-[34px]">Words make sense <span
               class="italic text-[#82917f]">together.</span></h1>
-          <p class="mt-3 text-sm text-[#898a81]">点亮的词语可以点击，看看它们在这里的意思。</p>
+          <p class="mt-1.5 text-sm text-[#898a81]">点亮的词语可以点击，看看它们在这里的意思。</p>
         </div>
         <div class="hidden text-right text-xs text-[#9a9b92] md:block">A short passage<br />Every word has a place</div>
       </div>
       <section
-        class="reading-layout grid min-h-0 flex-1 grid-cols-1 grid-rows-[minmax(38%,0.9fr)_minmax(0,1.1fr)] overflow-hidden rounded-2xl border border-[#e8e6df] bg-white shadow-[0_12px_40px_rgba(43,48,38,.035)] lg:grid-rows-1 lg:grid-cols-[1.02fr_.98fr]">
+        class="reading-layout grid min-h-0 flex-1 grid-cols-1 grid-rows-[minmax(38%,0.9fr)_minmax(0,1.1fr)] overflow-hidden rounded-2xl border border-[#e8e6df] bg-white shadow-[0_12px_40px_rgba(43,48,38,.035)] md:grid-rows-1 md:grid-cols-[1.02fr_.98fr]">
         <div
-          class="reading-pane flex min-h-0 flex-col overflow-y-auto border-b border-[#eeece6] p-4 md:p-8 lg:border-b-0 lg:border-r lg:p-10">
+          class="reading-pane flex min-h-0 flex-col overflow-hidden border-b border-[#eeece6] p-4 md:border-b-0 md:border-r md:p-6 lg:p-8">
           <div class="flex items-center justify-between"><span
               class="text-[10px] font-semibold uppercase tracking-[.18em] text-[#9a9b91]">The passage</span>
             <div class="flex items-center gap-2"><button
@@ -1151,8 +1202,10 @@ onBeforeUnmount(() => deleteTimers.forEach(timer => clearTimeout(timer)))
                 class="rounded-full bg-[#273b32] px-3 py-1.5 text-[10px] text-white hover:bg-[#385344]"
                 @click="showForm = !showForm">+ 新增句子</button></div>
           </div>
-          <div class="mt-3 flex items-center gap-2"><button class="rounded-full border border-[#e9e8e1] px-3 py-1.5 text-[10px] text-[#62645c] disabled:opacity-40" :disabled="availablePassages.length < 2" @click="navigatePassage(-1)">← 上一句</button><button class="rounded-full border border-[#e9e8e1] px-3 py-1.5 text-[10px] text-[#62645c] disabled:opacity-40" :disabled="availablePassages.length < 2" @click="navigatePassage(1)">下一句 →</button><button class="ml-auto rounded-full bg-[#f3f4ef] px-3 py-1.5 text-[10px] text-[#526b55] disabled:opacity-40" :disabled="availablePassages.length < 2" @click="navigatePassage('random')">随机一句 ⤨</button></div><div v-if="speechSupported" class="mt-3 flex flex-wrap items-center gap-2"><button class="min-h-10 rounded-full border border-[#e9e8e1] bg-white px-3 py-2 text-xs text-[#49634e]" @click="toggleSentenceSpeech">{{ sentenceSpeaking ? '■ 停止' : '🔊 朗读整句' }}</button><button class="min-h-10 rounded-full border px-3 py-2 text-xs" :class="sentenceSpeechRate === 0.7 ? 'border-[#9bad96] bg-[#f0f4ed] text-[#49634e]' : 'border-[#e9e8e1] text-[#777]'" @click="sentenceSpeechRate = 0.7">0.7x</button><button class="min-h-10 rounded-full border px-3 py-2 text-xs" :class="sentenceSpeechRate === 1 ? 'border-[#9bad96] bg-[#f0f4ed] text-[#49634e]' : 'border-[#e9e8e1] text-[#777]'" @click="sentenceSpeechRate = 1">1x</button></div>
-          <div class="mt-3 flex flex-wrap items-center gap-2"><button type="button" class="min-h-10 rounded-full border border-[#e9e8e1] bg-white px-3 py-2 text-xs text-[#62645c]" @click="supplementTranslations">补全翻译</button><span v-if="translationProgress.running" class="text-xs text-[#82917f]">翻译中 {{ translationProgress.completed }} / {{ translationProgress.total }}</span><template v-else-if="translationFailed.length"><span class="text-xs text-[#a36b5b]">有 {{ translationFailed.length }} 句翻译失败</span><button type="button" class="min-h-10 rounded-full px-3 py-2 text-xs text-[#49634e] underline underline-offset-2" @click="retryFailedTranslations">重新翻译</button></template></div>
+          <div class="passage-toolbar mt-3 flex flex-wrap items-center justify-between gap-2">
+            <div class="flex flex-wrap items-center gap-2"><button class="min-h-10 rounded-full border border-[#e9e8e1] px-3 py-2 text-xs text-[#62645c] disabled:opacity-40" :disabled="availablePassages.length < 2" @click="navigatePassage(-1)">← 上一句</button><button class="min-h-10 rounded-full border border-[#e9e8e1] px-3 py-2 text-xs text-[#62645c] disabled:opacity-40" :disabled="availablePassages.length < 2" @click="navigatePassage(1)">下一句 →</button><button class="min-h-10 rounded-full bg-[#f3f4ef] px-3 py-2 text-xs text-[#526b55] disabled:opacity-40" :disabled="availablePassages.length < 2" @click="navigatePassage('random')">随机一句 ⤨</button></div>
+            <div v-if="speechSupported" class="flex flex-wrap items-center gap-2"><button class="min-h-10 rounded-full border border-[#e9e8e1] bg-white px-3 py-2 text-xs text-[#49634e]" @click="toggleSentenceSpeech">{{ sentenceSpeaking ? '■ 停止' : '🔊 朗读整句' }}</button><button class="min-h-10 rounded-full border border-[#e9e8e1] bg-[#f0f4ed] px-3 py-2 text-xs text-[#49634e]" @click="sentenceSpeechRate = sentenceSpeechRate === 0.7 ? 1 : 0.7">语速 {{ sentenceSpeechRate }}x · 切换</button></div>
+          </div>
           <form v-if="showForm" class="mt-5 space-y-3 rounded-xl bg-[#f7f7f3] p-4" @submit.prevent="addPassage">
             <div class="flex gap-2 border-b border-[#e8e6df] pb-2"><button type="button" class="rounded-full px-3 py-2 text-xs" :class="addTab === 'sentence' ? 'bg-[#273b32] text-white' : 'text-[#777]'" @click="addTab = 'sentence'">新增句子</button><button type="button" class="rounded-full px-3 py-2 text-xs" :class="addTab === 'article' ? 'bg-[#273b32] text-white' : 'text-[#777]'" @click="addTab = 'article'">导入文章</button></div>
             <template v-if="addTab === 'sentence'">
@@ -1172,15 +1225,16 @@ onBeforeUnmount(() => deleteTimers.forEach(timer => clearTimeout(timer)))
             </template>
           </form>
           <div
-            class="sentence-display my-auto py-14 font-serif text-[27px] leading-[2.15] tracking-[-.02em] text-[#35372f] md:text-[32px]">
+            class="sentence-display my-auto py-10 font-serif text-[clamp(24px,3vw,40px)] leading-[1.85] tracking-[-.02em] text-[#35372f]">
             <template v-for="(token, index) in tokens" :key="index"><button v-if="token.key" class="interactive-word"
                 :class="{ 'active-word': selectedId === token.key }" @click="analyze(token.key)">{{ token.text
                 }}</button><span v-else>{{ token.text }}</span></template>
 
 
           </div>
-          <div class="border-t border-[#f0efe9] pt-5">
-            <div class="flex flex-wrap items-center gap-3"><p class="text-[13px] leading-6 text-[#85877d]" :class="{ 'translation-blurred': !translationVisible }">{{ activePassage.translation || '尚未填写中文翻译' }}</p><button class="min-h-10 rounded-full border border-[#e9e8e1] bg-white px-3 py-2 text-xs text-[#62645c]" @click="translationVisible = !translationVisible">{{ translationVisible ? '隐藏翻译' : '显示翻译' }}</button></div>
+          <div class="border-t border-[#f0efe9] pt-4">
+            <div v-if="isTranslationMissing(activePassage.translation)" class="flex flex-wrap items-center gap-x-2 gap-y-1 text-[13px] leading-6 text-[#85877d]"><span>尚未翻译 ·</span><button class="min-h-10 rounded-lg px-1 text-left font-medium text-[#526b55] underline underline-offset-2" @click="translateActivePassage">{{ translationProgress.running && translationQueuedKeys.has(activePassage.sentence.trim().toLowerCase()) ? '翻译中…' : '翻译这句' }}</button><span v-if="translationFailed.includes(activePassage.sentence.trim().toLowerCase())" class="text-xs text-[#a36b5b]">翻译失败</span><button v-if="translationFailed.includes(activePassage.sentence.trim().toLowerCase())" class="min-h-10 rounded-lg px-1 text-xs text-[#49634e] underline underline-offset-2" @click="retryFailedTranslations">重新翻译</button></div>
+            <p v-else class="cursor-pointer text-[13px] leading-6 text-[#85877d]" :class="{ 'translation-blurred': !translationVisible }" title="点击显示或遮住翻译" @click="translationVisible = !translationVisible">{{ activePassage.translation }}</p>
             <p class="mt-2 text-[10px] text-[#b0b1a8]">↗ 点击高亮词语，查看语境中的解析</p>
           </div>
         </div>
