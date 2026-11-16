@@ -192,4 +192,4 @@ src/
 
 ## 许可证
 
-请在此处补充，例如 MIT。
+本项目基于 [MIT 许可证](LICENSE) 开源，详情请查看 [LICENSE](LICENSE) 文件。
