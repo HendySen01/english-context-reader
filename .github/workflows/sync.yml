@@ -17,6 +17,3 @@ jobs:
           dst_key: ${{ secrets.GITEE_PASSWORD }}
           dst_token: ${{ secrets.GITEE_PASSWORD }}
           account_type: user
-          # 核心設定：將 GitHub 的 main 分支對應同步到 Gitee 的 master 分支
-          src_branch: main
-          dst_branch: master
