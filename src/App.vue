@@ -9,6 +9,7 @@ import { buildAnkiCsv, buildStarredNotesCsv } from './lib/csv.js'
 import { createBackupJson, parseBackupData } from './lib/backup.js'
 import { calculateStreakDays, localDateKey } from './lib/date.js'
 import { readStorage, readStorageJson, writeStorage, writeStorageJson } from './lib/storage.js'
+import { validateAnalysis, validateTranslations } from './lib/validate.js'
 import AuthModal from './components/AuthModal.vue'
 import SettingsModal from './components/SettingsModal.vue'
 import ImportConfirmModal from './components/ImportConfirmModal.vue'
@@ -394,6 +395,8 @@ async function recordLookup(word, cacheKey) {
 }
 async function saveCloudNote(word, passageId, value, includeReviewFields = true) {
   if (!supabase || !user.value) return
+  // 占位说明仅供临时展示，任何保存入口都不把它写入云端。
+  if (String(value?.definition || '').includes('语境占位说明')) return
   const normalized = word.trim().toLowerCase()
   const payload = { user_id: user.value.id, word: normalized, data: { passageId, analysis: value, context_sentence: value.context_sentence || null, context_translation: value.context_translation || null }, updated_at: new Date().toISOString() }
   if (includeReviewFields) Object.assign(payload, { is_starred: !!value.is_starred, review_count: value.review_count || 0, next_review_at: value.next_review_at || new Date().toISOString() })
@@ -685,8 +688,9 @@ async function fetchWordContext(word, fullSentence) {
   if (!apiKey.value.trim()) throw new Error('未配置 API Key')
   const base = apiBaseUrl.value.trim().replace(/\/+$/, '')
   if (!base || !apiModel.value.trim()) throw new Error('请填写有效的 Base URL 和 Model')
-  let lastError
-  for (let attempt = 0; attempt < 2; attempt++) {
+  const maxRetries = 2
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    let rawContent = null
     try {
       // 使用 JSON 模式并提高输出上限，降低格式漂移和内容截断概率。
       // 深度词源 JSON 较长，提升上限避免例句字段被截断。
@@ -696,31 +700,28 @@ async function fetchWordContext(word, fullSentence) {
         const hint = response.status === 401 ? 'API Key 无效或权限不足。' : response.status === 403 ? '当前 Key 无权调用该模型。' : response.status === 404 ? '检查 Base URL、接口路径和模型服务商文档。' : `HTTP ${response.status}`
         throw new Error(`${hint}${detail ? ` 服务端信息：${detail.slice(0, 240)}` : ''}`)
       }
-      const data = await response.json()
-      const content = data.choices?.[0]?.message?.content
-      if (!content) throw new Error('接口响应缺少 choices[0].message.content')
-      // finish_reason=length 表示模型触及输出上限，直接触发一次重试。
-      if (data.choices?.[0]?.finish_reason === 'length') throw new SyntaxError('模型输出达到 token 上限，JSON 可能被截断。')
-      // 临时输出原文以定位偶发的格式错误或截断位置。
-      // console.log('[LLM 原始返回]', content)
-      const cleaned = content.replace(/```(?:json)?\s*/gi, '').replace(/```/g, '').trim()
-      const start = cleaned.indexOf('{'); const end = cleaned.lastIndexOf('}')
-      const parsed = JSON.parse(start >= 0 && end > start ? cleaned.slice(start, end + 1) : cleaned)
-      const required = ['text', 'type', 'pronunciation', 'partOfSpeech', 'definition', 'usage', 'etymology', 'semanticRoutes', 'comparisons', 'examples']
-      const missing = required.filter(key => parsed[key] == null)
-      // 至少要有一项；超出的内容截取到面板约定数量。
-      if (missing.length || !parsed.etymology?.originalImage || !Array.isArray(parsed.semanticRoutes) || parsed.semanticRoutes.length < 1 || !Array.isArray(parsed.examples) || parsed.examples.length < 1 || !Array.isArray(parsed.comparisons) || parsed.comparisons.some(item => !item.word || !item.difference || !item.partOfSpeech)) throw new Error('模型返回的数据结构不完整，请重试。')
-      // 保留最多两条例句和三条演变线路，避免多返回时报错。
-      parsed.examples = parsed.examples.slice(0, 2)
-      parsed.semanticRoutes = parsed.semanticRoutes.slice(0, 3)
-      return parsed
-    } catch (error) {
-      lastError = error
-      if (attempt === 0 && error instanceof SyntaxError) console.warn('[LLM JSON 解析失败，自动重试一次]', error.message)
-      else if (!(error instanceof SyntaxError) || attempt === 1) throw error
+      // 留下未经清理的原文，校验失败时可直接定位模型输出与字段路径。
+      const responseText = await response.text()
+      rawContent = responseText
+      const data = JSON.parse(responseText)
+      const content = data?.choices?.[0]?.message?.content
+      rawContent = content ?? responseText
+      const validation = validateAnalysis(content)
+      const validationErrors = [...validation.errors]
+      if (typeof content !== 'string') validationErrors.push('choices[0].message.content 必须是字符串')
+      if (data?.choices?.[0]?.finish_reason === 'length') validationErrors.push('finish_reason 为 length，模型输出可能被截断')
+      if (validationErrors.length) {
+        throw Object.assign(new Error('模型解析结构校验失败'), { validationErrors })
+      }
+      return validation.data
+    } catch (cause) {
+      const invalidResponse = cause instanceof SyntaxError || Array.isArray(cause.validationErrors)
+      if (invalidResponse) {
+        console.error('[LLM 解析校验失败]', { word, attempt: attempt + 1, raw: rawContent, errors: cause.validationErrors || [cause.message] })
+      }
+      if (!invalidResponse || attempt === maxRetries) throw cause
     }
   }
-  throw lastError
 }
 async function analyze(key, countLookup = true) {
   selectedId.value = key; error.value = ''
@@ -728,18 +729,19 @@ async function analyze(key, countLookup = true) {
   if (countLookup) await recordLookup(key, cacheKey)
   if (mockMap[key]) return
   // 当前句子的 id 与词条组成唯一缓存 key。
-  if (cache.value[cacheKey]?.llmSuccess === true) return
+  const cached = cache.value[cacheKey]
+  if (cached?.llmSuccess === true && validateAnalysis(cached).ok) return
   // Clear legacy placeholder cache entries; only successful model results are cached.
   if (cache.value[cacheKey]) delete cache.value[cacheKey]
   loading.value = true
   try {
     const parsed = await fetchWordContext(key, activePassage.value.sentence)
     // 解析刷新沿用收藏与复习状态，避免覆盖星标数据。
-    const previous = cache.value[cacheKey] || {}
+    const previous = cache.value[cacheKey] || cached || {}
     cache.value[cacheKey] = { ...parsed, id: key, text: parsed.text || key, dynamic: true, llmSuccess: true, deepSchema: 4, context_sentence: activePassage.value.sentence, context_translation: activePassage.value.translation || '', is_starred: previous.is_starred || false, review_count: previous.review_count || 0, next_review_at: previous.next_review_at, lookup_count: Math.max(Number(previous.lookup_count) || 0, Number(lookupCounts.value[key.trim().toLowerCase()]) || 0) }
     await saveCloudNote(key, activePassage.value.id, cache.value[cacheKey], false)
   } catch (cause) {
-    error.value = '解析请求未成功，当前显示临时说明；点击词语可重试。'
+    error.value = '解析失败，点击重试'
     console.error('[fetchWordContext]', { baseUrl: apiBaseUrl.value, model: apiModel.value, word: key, error: cause })
   } finally { loading.value = false }
 }
@@ -747,17 +749,35 @@ async function translateSentencesBatch(sentences) {
   if (!apiKey.value.trim()) throw new Error('请先在设置中填写 API Key')
   const base = apiBaseUrl.value.trim().replace(/\/+$/, '')
   const indexedSentences = sentences.map((sentence, i) => ({ i, english: sentence }))
-  const response = await fetch('/api/llm', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ baseUrl: base, model: apiModel.value.trim(), apiKey: apiKey.value.trim(), temperature: 0.3, max_tokens: 4000, messages: [{ role: 'system', content: '你是专业英语译者。将每句英文译成自然、准确、流畅的简体中文，兼顾信、达、雅。必须只输出一个严格合法的 JSON 数组，不要 Markdown、代码围栏或解释。数组每项格式为 {"i":0,"zh":"译文"}，i 必须对应输入编号，所有输入句子都必须有一项。' }, { role: 'user', content: JSON.stringify(indexedSentences) }] }) })
-  if (!response.ok) throw new Error(`翻译服务暂不可用（${response.status}）`)
-  const data = await response.json()
-  const content = data.choices?.[0]?.message?.content
-  if (!content) throw new Error('翻译服务未返回内容')
-  const cleaned = content.replace(/```(?:json)?\s*/gi, '').replace(/```/g, '').trim()
-  const start = cleaned.indexOf('['); const end = cleaned.lastIndexOf(']')
-  if (start < 0 || end < start) throw new Error('翻译结果不是 JSON 数组')
-  const parsed = JSON.parse(cleaned.slice(start, end + 1))
-  if (!Array.isArray(parsed)) throw new Error('翻译结果不是 JSON 数组')
-  return new Map(parsed.filter(item => Number.isInteger(item?.i) && typeof item.zh === 'string' && item.zh.trim()).map(item => [item.i, item.zh.trim()]))
+  const maxRetries = 2
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    let rawContent = null
+    try {
+      const response = await fetch('/api/llm', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ baseUrl: base, model: apiModel.value.trim(), apiKey: apiKey.value.trim(), temperature: 0.3, max_tokens: 4000, messages: [{ role: 'system', content: '你是专业英语译者。将每句英文译成自然、准确、流畅的简体中文，兼顾信、达、雅。必须只输出一个严格合法的 JSON 数组，不要 Markdown、代码围栏或解释。数组每项格式为 {"i":0,"zh":"译文"}，i 必须对应输入编号，所有输入句子都必须有一项。' }, { role: 'user', content: JSON.stringify(indexedSentences) }] }) })
+      if (!response.ok) throw new Error(`翻译服务暂不可用（${response.status}）`)
+      const responseText = await response.text()
+      rawContent = responseText
+      const data = JSON.parse(responseText)
+      const content = data?.choices?.[0]?.message?.content
+      rawContent = content ?? responseText
+      const validation = validateTranslations(content, sentences.length)
+      if (typeof content !== 'string') {
+        throw Object.assign(new Error('翻译服务未返回有效内容'), { validationErrors: ['choices[0].message.content 必须是字符串'] })
+      }
+      // 部分条目错误时保留有效译文，队列只把缺少译文的句子列为失败。
+      if (validation.data.length || validation.ok) {
+        if (validation.errors.length) console.error('[翻译条目校验失败]', { attempt: attempt + 1, raw: rawContent, errors: validation.errors })
+        return new Map(validation.data.map(item => [item.i, item.zh]))
+      }
+      throw Object.assign(new Error('批量翻译结构校验失败'), { validationErrors: validation.errors })
+    } catch (cause) {
+      const invalidResponse = cause instanceof SyntaxError || Array.isArray(cause.validationErrors)
+      if (invalidResponse) {
+        console.error('[翻译结果校验失败]', { attempt: attempt + 1, raw: rawContent, errors: cause.validationErrors || [cause.message] })
+      }
+      if (!invalidResponse || attempt === maxRetries) throw cause
+    }
+  }
 }
 async function addPassage() {
   const sentence = draftSentence.value.trim(); if (!sentence) return
@@ -1146,7 +1166,7 @@ onBeforeUnmount(() => deleteTimers.forEach(timer => clearTimeout(timer)))
               </div>
               <p class="mt-5 text-sm leading-7 text-[#696b62]">{{ selected.definition }}</p>
               <p v-if="loading" class="mt-3 text-xs text-[#82917f]">正在根据句子语境生成解析…</p>
-              <p v-if="error" class="mt-2 text-xs text-[#a56d52]">{{ error }}</p>
+              <p v-if="error" class="mt-2 text-xs text-[#a56d52]"><span v-if="error === '解析失败，点击重试'" role="button" tabindex="0" @click="analyze(selectedId, false)" @keydown.enter="analyze(selectedId, false)" @keydown.space.prevent="analyze(selectedId, false)">{{ error }}</span><template v-else>{{ error }}</template></p>
               <div class="mt-7 rounded-xl bg-[#f4f5f0] p-4">
                 <h3 class="section-label">语境中的核心用法 <span>IN CONTEXT</span></h3>
                 <p class="mt-3 text-xs leading-6 text-[#62665d]">{{ selected.usage || selected.etymology }}</p>
