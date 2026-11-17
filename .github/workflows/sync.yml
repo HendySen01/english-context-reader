@@ -8,13 +8,12 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - name: Mirror the Github repo to Gitee
+      - name: Mirroring
         uses: Yikun/hub-mirror-action@master
         with:
           src: github/HendySen01/english-context-reader
           dst: gitee/yfhs/english-context-reader
           static_list: "english-context-reader"
-          clear_out_branch: true
           dst_key: ${{ secrets.GITEE_PASSWORD }}
           dst_token: ${{ secrets.GITEE_PASSWORD }}
           account_type: user
