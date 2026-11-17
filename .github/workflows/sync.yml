@@ -21,4 +21,3 @@ jobs:
           account_type: user
           static_list: "english-context-reader"
           clone_style: "https"
-          user: ${{ secrets.GITEE_USER }}
