@@ -1,4 +1,4 @@
-name: Sync to Gitee
+name: sync
 
 on:
   push:
@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Mirror the Github repo to Gitee
-        uses: Yikun/hub-mirror-action@v1.4.0
+        uses: Yikun/hub-mirror-action@master
         with:
           src: github/HendySen01/english-context-reader
           dst: gitee/yfhs/english-context-reader
