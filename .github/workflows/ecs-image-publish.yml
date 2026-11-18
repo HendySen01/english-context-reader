@@ -1,0 +1,90 @@
+name: Publish reviewed ECS images
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [feat/ecs-deployment]
+    paths: ['.github/workflows/ecs-image-publish.yml']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ecs-reviewed-image-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'HendySen01/english-context-reader' && github.ref == 'refs/heads/feat/ecs-deployment'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: ecs-ghcr-release
+    permissions:
+      contents: read
+      packages: write
+    env:
+      SOURCE_SHA: 73bb384ee031452cd2a7a2f1a16cbee74aa0ec97
+      CI_BUILD_IMAGE_PREFIX: ghcr.io/hendysen01/english-context-reader
+      CI_PUBLIC_SUPABASE_URL: ${{ vars.ECS_PUBLIC_SUPABASE_URL }}
+      CI_PUBLIC_SUPABASE_KEY: ${{ vars.ECS_PUBLIC_SUPABASE_KEY }}
+      CONFIG_APPROVED_SHA: ${{ vars.ECS_PUBLIC_CONFIG_APPROVED_SHA }}
+    steps:
+      - name: Require explicit approval of this publishing revision
+        env:
+          APPROVED_PUBLISHER_SHA: ${{ vars.ECS_APPROVED_PUBLISHER_SHA }}
+        run: |
+          if [[ ! "$APPROVED_PUBLISHER_SHA" =~ ^[0-9a-f]{40}$ || "$APPROVED_PUBLISHER_SHA" != "$GITHUB_SHA" ]]; then
+            echo 'This publishing revision is not approved.' >&2
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: publisher
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          ref: 73bb384ee031452cd2a7a2f1a16cbee74aa0ec97
+          path: source
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Confirm source and approved public configuration
+        working-directory: source
+        run: |
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$CONFIG_APPROVED_SHA" = "$SOURCE_SHA"
+          node --input-type=module -e '
+            import { validatePublicConfig } from "../publisher/deploy/publish/public-config.mjs";
+            if (!validatePublicConfig(process.env.CI_PUBLIC_SUPABASE_URL, process.env.CI_PUBLIC_SUPABASE_KEY)) {
+              console.error("Invalid or missing public Supabase configuration.");
+              process.exit(1);
+            }
+          '
+      - name: Test publication guards without registry access
+        run: |
+          python3 -B -m unittest discover -s publisher/test -p 'registry_test.py' -v
+          node --test publisher/test/public-config.test.js
+      - name: Test, build and audit the exact release images
+        working-directory: source
+        run: |
+          npm ci --no-audit --no-fund
+          npm test
+          export CI_BUILD_RELEASE="$SOURCE_SHA"
+          bash ../publisher/deploy/ci/verify.sh
+      - name: Check private packages and publish without overwriting a version
+        working-directory: source
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+          GHCR_USER: ${{ github.actor }}
+        run: python3 ../publisher/deploy/publish/registry.py
+      - name: Save verified release references
+        uses: actions/upload-artifact@v4
+        with:
+          name: ecs-release-73bb384ee031452cd2a7a2f1a16cbee74aa0ec97
+          path: |
+            source/release.lock.yaml
+            source/release.json
+          retention-days: 14
+          if-no-files-found: error
