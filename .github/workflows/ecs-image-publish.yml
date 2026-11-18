@@ -63,9 +63,10 @@ jobs:
             }
           '
       - name: Test publication guards without registry access
+        working-directory: publisher
         run: |
-          python3 -B -m unittest discover -s publisher/test -p 'registry_test.py' -v
-          node --test publisher/test/public-config.test.js
+          python3 -B -m unittest discover -s test -p 'registry_test.py' -v
+          node --test test/public-config.test.js
       - name: Test, build and audit the exact release images
         working-directory: source
         run: |
