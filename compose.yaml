@@ -54,7 +54,8 @@ services:
     cpus: 1.00
     pids_limit: 64
     restart: unless-stopped
-    stop_grace_period: 25s
+    # Match the API's 180s drain and allow time to flush error responses.
+    stop_grace_period: 190s
     logging: *logging
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/healthz').then(r=>{if(!r.ok)process.exitCode=1}).catch(()=>{process.exitCode=1})"]

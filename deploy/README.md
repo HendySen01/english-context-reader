@@ -34,6 +34,19 @@ curl --fail http://127.0.0.1:8080/healthz
 
 可用 `node --env-file=.env.rls-test deploy/check-rls.mjs` 运行只读的双账号登录和 RLS 检查。使用独立测试项目，为两个账号分别准备每张表至少一行，在被 Git 忽略的 `.env.rls-test` 中配置 `RLS_TEST_SUPABASE_URL`、`RLS_TEST_SUPABASE_KEY`（publishable key）、`RLS_TEST_EMAIL_A/B` 和 `RLS_TEST_PASSWORD_A/B`（A、B 分别使用独立变量）。写入隔离仍需按第 4 步在测试项目验收。
 
+### GitHub Actions 容器验证
+
+`.github/workflows/ecs-container-test.yml` 的验证任务只在 `feat/ecs-deployment` 执行。首次将包含该文件的提交推送到此分支时，由 `push` 触发验证。以后只有修改了该工作流文件的推送才会自动运行，普通业务代码提交不会自动运行。工作流使用 GitHub 托管的 Ubuntu 24.04 runner，权限为 `contents: read`，同一时间最多执行一次。
+
+保留 `workflow_dispatch` 便于手动验证。GitHub 要求手动触发的工作流已存在于默认分支。默认分支尚无该文件时，首次验证使用上述受限的 `push` 事件。若工作流随后经批准进入默认分支，可在 Actions 页面选 `feat/ecs-deployment` 并点击 Run workflow。若要不改默认分支而重跑同一提交，可在 Actions 中对已有运行使用 Re-run jobs。首次推送前请核对 Vercel 的 Production Branch。Vercel 的 Git 集成独立于 GitHub Actions，非生产分支也可能生成 Preview。
+
+经批准后，也可在已有 Docker Compose v2 的临时 Linux AMD64 runner 执行 `npm ci && npm test && bash deploy/ci/verify.sh`。脚本使用独立 Compose 项目、临时卷、占位配置和模拟账户。构建需要访问基础镜像和 npm 依赖来源。测试不调用 Supabase、DeepSeek 或 ECS，不发布镜像。
+
+1. 校验 Compose，分别构建 Web 和 API，检查镜像架构、构建日志、镜像历史和应用镜像层的禁入文件与随机测试标记。
+2. 使用生产入口启动两份镜像，验证 `nginx -t`、健康状态、回环发布端口、代理的无凭据 401 响应、API 的默认 UID、只读密钥挂载和配额卷写权限。
+3. 使用 CI 覆盖配置启动模拟上游。通过 Nginx 验证解析、部分翻译、配额卷重启持久化、客户端断开传递和 SIGTERM 停机。
+4. 用 `docker stats --no-stream` 采样 Web 与 API，清理当前作业的日志、容器和临时卷。样本只代表 CI 负载。测试覆盖把 API 的出口网络设为 internal。ECS 宿主机的防火墙和元数据隔离仍需另行验收。
+
 ## 出口隔离
 
 应用仅从 `api.deepseek.com` 解析 IPv4，拒绝非公网结果，把 TLS 连接固定在已验证 IP 上，且禁止重定向。Supabase SDK 访问服务器配置的项目域名。应用外还应限制容器能到达的网络。
@@ -60,6 +73,8 @@ curl --fail http://127.0.0.1:8080/healthz
 ```
 
 4. 检查 HTTPS 登录、账号隔离和获准的 AI 请求。用 `docker stats --no-stream` 查看资源占用。更新建议选低峰时间，单实例切换期间可能短暂中断。日志默认轮转。
+
+API 收到 SIGTERM 或 SIGINT 后停止接收新连接，给已接收请求最多 180 秒完成，每个请求仍受自身 180 秒限制。正常请求超时返回 504。若停机截止时仍有在途请求，API 会在连接可写时返回 503 和 `Retry-After: 5`，同时取消 DNS、鉴权或模型请求。再保留最多 5 秒写出响应。Compose 给 API 190 秒停止宽限期。单实例切换期间，代理也可能因后端暂不可达而返回网关错误。
 
 ## 回滚与费用
 

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
+import { Resolver } from 'node:dns/promises'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -32,6 +33,149 @@ test('SSRF: mixed DNS answers and special addresses fail closed', async () => {
     await assert.rejects(resolvePublicIPv4('api.deepseek.com', undefined, async () => ['8.8.8.8', denied]))
   }
   await assert.rejects(resolvePublicIPv4('api.deepseek.com', undefined, async () => []))
+})
+
+test('DNS abort cancels the resolver and rejects with the abort reason', { timeout: 5000 }, async t => {
+  let failLookup
+  const resolve4 = t.mock.method(Resolver.prototype, 'resolve4', () => new Promise((_, reject) => { failLookup = reject }))
+  const cancel = t.mock.method(Resolver.prototype, 'cancel', () => failLookup(new Error('DNS query cancelled')))
+  const controller = new AbortController()
+  const lookup = resolvePublicIPv4('api.deepseek.com', controller.signal)
+  assert.equal(resolve4.mock.callCount(), 1)
+  controller.abort()
+  await assert.rejects(lookup, { name: 'AbortError' })
+  assert.equal(cancel.mock.callCount(), 1)
+  await assert.rejects(resolvePublicIPv4('api.deepseek.com', controller.signal), { name: 'AbortError' })
+  assert.equal(resolve4.mock.callCount(), 1)
+})
+
+async function listenForTest(t, api) {
+  await new Promise(resolve => api.listen(0, '127.0.0.1', resolve))
+  t.after(() => {
+    api.closeAllConnections()
+    return api.shutdown()
+  })
+  const origin = `http://127.0.0.1:${api.address().port}`
+  return (signal, token = 'fake.account.a') => fetch(`${origin}/api/llm`, {
+    method: 'POST', signal,
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify(body)
+  })
+}
+
+for (const phase of ['dns', 'https']) {
+  test(`disconnect cancels the in-flight ${phase} operation`, { timeout: 5000 }, async t => {
+    const started = Promise.withResolvers()
+    const cancelled = Promise.withResolvers()
+    let httpsCalls = 0
+    const complete = createProvider('test-secret', {
+      resolve: (host, signal) => resolvePublicIPv4(host, signal, async (_, lookupSignal) => {
+        if (phase === 'https') return ['8.8.8.8']
+        await new Promise((_, reject) => {
+          lookupSignal.addEventListener('abort', () => {
+            cancelled.resolve()
+            reject(lookupSignal.reason)
+          }, { once: true })
+          started.resolve()
+        })
+      }),
+      httpsRequest({ signal }) {
+        httpsCalls++
+        const request = new EventEmitter()
+        request.end = () => {
+          signal.addEventListener('abort', () => {
+            cancelled.resolve()
+            request.emit('error', signal.reason)
+          }, { once: true })
+          started.resolve()
+        }
+        return request
+      }
+    })
+    const api = createApi({
+      getUser: async () => ({ data: { user: { id: 'a' } } }),
+      allowedAccounts: new Set(['a']), reserve() {}, complete
+    })
+    const post = await listenForTest(t, api)
+    const controller = new AbortController()
+    const result = assert.rejects(post(controller.signal), { name: 'AbortError' })
+    await started.promise
+    controller.abort()
+    await Promise.all([result, cancelled.promise])
+    assert.equal(httpsCalls, phase === 'https' ? 1 : 0)
+  })
+}
+
+test('shutdown drains accepted work, closes the listener and is idempotent', { timeout: 5000 }, async t => {
+  const started = Promise.withResolvers()
+  const answer = Promise.withResolvers()
+  const api = createApi({
+    getUser: async () => ({ data: { user: { id: 'a' } } }),
+    allowedAccounts: new Set(['a']), reserve() {},
+    complete: async () => { started.resolve(); return answer.promise }
+  })
+  const post = await listenForTest(t, api)
+  const result = post()
+  await started.promise
+  const closing = api.shutdown()
+  assert.equal(api.listening, false)
+  assert.equal(api.shutdown(), closing)
+  await assert.rejects(post(), TypeError)
+  answer.resolve(envelope({ definition: '阅读' }))
+  assert.equal((await result).status, 200)
+  await closing
+})
+
+test('shutdown deadline returns retryable 503 and aborts remaining work', { timeout: 5000 }, async t => {
+  const started = Promise.withResolvers()
+  const cancelled = Promise.withResolvers()
+  const api = createApi({
+    getUser: async () => ({ data: { user: { id: 'a' } } }),
+    allowedAccounts: new Set(['a']), reserve() {}, drainMs: 30, flushMs: 500,
+    complete: (_, signal) => new Promise((_, reject) => {
+      signal.addEventListener('abort', () => {
+        cancelled.resolve()
+        reject(signal.reason)
+      }, { once: true })
+      started.resolve()
+    })
+  })
+  const post = await listenForTest(t, api)
+  const result = post()
+  await started.promise
+  const closing = api.shutdown()
+  const response = await result
+  assert.equal(response.status, 503)
+  assert.equal(response.headers.get('retry-after'), '5')
+  assert.match((await response.json()).error, /shutting down/)
+  await Promise.all([closing, cancelled.promise])
+})
+
+test('global concurrency rejects other accounts and returns capacity after a timeout', { timeout: 5000 }, async t => {
+  const started = Promise.withResolvers()
+  const reservations = []
+  const api = createApi({
+    getUser: async token => ({ data: { user: { id: token.split('.').at(-1) } } }),
+    allowedAccounts: new Set(['a', 'b']),
+    reserve: id => reservations.push(id),
+    concurrency: 1,
+    timeoutMs: 250,
+    complete: async (_, signal) => {
+      if (reservations.at(-1) === 'b') return envelope({ definition: '阅读' })
+      const stopped = new Promise((_, reject) => {
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+      })
+      started.resolve()
+      return stopped
+    }
+  })
+  const post = await listenForTest(t, api)
+  const first = post()
+  await started.promise
+  assert.equal((await post(undefined, 'fake.account.b')).status, 429)
+  assert.equal((await first).status, 504)
+  assert.equal((await post(undefined, 'fake.account.b')).status, 200)
+  assert.deepEqual(reservations, ['a', 'b'])
 })
 
 test('SSRF: transport pins the checked IP, uses provider TLS name, and refuses redirects', async () => {

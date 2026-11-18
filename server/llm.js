@@ -31,6 +31,7 @@ export function prepareCompletion(input) {
 export function createProvider(apiKey, { resolve = resolvePublicIPv4, httpsRequest = request } = {}) {
   return async (payload, signal) => {
     const address = await resolve(provider.host, signal)
+    signal?.throwIfAborted()
     const body = JSON.stringify(payload)
     return new Promise((resolveResponse, reject) => {
       // Connect to the checked IP without a second DNS lookup. Keep TLS SNI and certificate verification for the provider.

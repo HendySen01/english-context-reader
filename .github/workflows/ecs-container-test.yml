@@ -1,0 +1,35 @@
+name: ECS container validation
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/ecs-deployment
+    paths:
+      - '.github/workflows/ecs-container-test.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ecs-container-validation
+  cancel-in-progress: false
+
+jobs:
+  containers:
+    if: github.ref == 'refs/heads/feat/ecs-deployment'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Local regression tests
+        run: |
+          npm ci --no-audit --no-fund
+          npm test
+      - name: Build and verify isolated Linux AMD64 containers
+        run: bash deploy/ci/verify.sh

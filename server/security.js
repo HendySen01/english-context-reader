@@ -32,7 +32,7 @@ blocked.addAddress('100.100.100.200')
 
 export async function resolvePublicIPv4(host, signal, resolve = resolveProvider) {
   signal?.throwIfAborted()
-  const addresses = await resolve(host)
+  const addresses = await resolve(host, signal)
   signal?.throwIfAborted()
   // Require public A records and never fall back to IPv6 or the system resolver.
   if (!addresses.length || addresses.some(ip => !isIPv4(ip) || blocked.check(ip))) {
@@ -47,6 +47,9 @@ async function resolveProvider(host, signal) {
   signal?.addEventListener('abort', cancel, { once: true })
   try {
     return await resolver.resolve4(host)
+  } catch (error) {
+    signal?.throwIfAborted()
+    throw error
   } finally {
     signal?.removeEventListener('abort', cancel)
   }

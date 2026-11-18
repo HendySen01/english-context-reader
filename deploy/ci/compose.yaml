@@ -1,0 +1,29 @@
+services:
+  web:
+    platform: linux/amd64
+  api:
+    platform: linux/amd64
+    restart: "no"
+    command: ["node", "${CI_API_ENTRY:-server/index.js}"]
+    volumes:
+      - ./deploy/ci/fixture.mjs:/ci/fixture.mjs:ro
+      - ${CI_STATE_DIR:?}:/ci/state
+  mock:
+    platform: linux/amd64
+    image: ${IMAGE_PREFIX}-api:${RELEASE}
+    pull_policy: never
+    command: ["node", "/ci/fixture.mjs", "mock"]
+    read_only: true
+    networks: [app]
+    volumes:
+      - ./deploy/ci/fixture.mjs:/ci/fixture.mjs:ro
+      - ${CI_STATE_DIR:?}:/ci/state
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3100/healthz').then(r=>{if(!r.ok)process.exitCode=1}).catch(()=>{process.exitCode=1})"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+networks:
+  egress:
+    internal: true
