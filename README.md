@@ -157,6 +157,10 @@ npm run preview  # 预览构建结果
 3. **Redeploy**（Vite 的环境变量在构建时写入代码，修改后必须重新部署才生效）
 4. 在 Supabase 后台 **Authentication → URL Configuration** 中，把你的线上域名加入 *Site URL* 与 *Redirect URLs*，否则验证邮件中的链接会跳回 localhost
 
+## 部署到阿里云 ECS
+
+Docker Compose 构建、代理安全、验收、更新和回滚见 [ECS 部署文档](deploy/README.md)。
+
 ## 项目结构
 
 ```
@@ -186,7 +190,7 @@ src/
 
 ## 已知限制与后续计划
 
-- 当前大模型请求由浏览器直接发出；计划增加 Vercel Serverless 转发接口，使 Key 不出现在前端，并增加登录校验与限流
+- 浏览器通过同源 `/api/llm` 请求模型。ECS 使用服务器密钥和账号授权，Vercel 与 Vite 开发环境各自使用原有代理。
 - `word_notes` 以 `(user_id, word)` 为唯一键，同一个词在多个句子中的解析会共用一条记录
 - 计划继续拆分 `App.vue`（生词本、阅读区、词条解析区、状态逻辑）
 

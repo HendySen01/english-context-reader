@@ -1,0 +1,25 @@
+server {
+    listen 80;
+    server_name reader.example.com;
+    return 308 https://reader.example.com$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name reader.example.com;
+    ssl_certificate /etc/letsencrypt/live/reader.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/reader.example.com/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    client_max_body_size 128k;
+    client_body_timeout 10s;
+
+    location = /healthz { return 404; }
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        # Overwrite the incoming header. Never accept an Internet client's claimed IP.
+        proxy_set_header X-Reader-Client-IP $remote_addr;
+        proxy_set_header Authorization $http_authorization;
+        proxy_read_timeout 190s;
+    }
+}

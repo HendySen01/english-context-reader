@@ -3,6 +3,7 @@ import { ref } from 'vue'
 
 defineProps({
   open: { type: Boolean, default: false },
+  managedAi: { type: Boolean, default: false },
   defaultBlurTranslation: { type: Boolean, default: true },
   dailyReviewGoal: { type: Number, default: 10 },
   apiBaseUrl: { type: String, default: '' },
@@ -31,7 +32,7 @@ const backupInput = ref(null)
         <option :value="10">10 个</option>
         <option :value="20">20 个</option>
         <option :value="30">30 个</option>
-      </select><label class="mt-4 block text-xs font-medium">Base
+      </select><template v-if="!managedAi"><label class="mt-4 block text-xs font-medium">Base
         URL</label><input :value="apiBaseUrl" type="url" placeholder="https://api.openai.com/v1"
         class="mt-2 w-full rounded-lg border border-[#e8e6df] px-3 py-2 text-sm outline-none focus:border-[#82917f]"
         @input="emit('update:apiBaseUrl', $event.target.value)" /><label
@@ -45,6 +46,8 @@ const backupInput = ref(null)
         @input="emit('update:apiKey', $event.target.value)" />
       <p class="mt-2 text-[11px] text-[#92938a]">点击未缓存词语时，通过本地 /api/llm 代理调用上方配置的兼容接口。
       </p>
+      </template>
+      <p v-else class="mt-4 text-xs text-[#777970]">AI 由本站提供，登录并获得授权后即可查词和翻译。</p>
     </div>
   </div>
 </template>

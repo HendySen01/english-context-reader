@@ -10,11 +10,14 @@ import { createBackupJson, parseBackupData } from './lib/backup.js'
 import { calculateStreakDays, localDateKey } from './lib/date.js'
 import { readStorage, readStorageJson, writeStorage, writeStorageJson } from './lib/storage.js'
 import { validateAnalysis, validateTranslations } from './lib/validate.js'
+import { AiAccessError, requestLlm as sendLlmRequest } from './lib/llm-request.js'
 import AuthModal from './components/AuthModal.vue'
 import SettingsModal from './components/SettingsModal.vue'
 import ImportConfirmModal from './components/ImportConfirmModal.vue'
 
 const STORE = 'context-reader-state-v1'
+const ecsAi = import.meta.env.VITE_AI_MODE === 'ecs'
+const requestLlm = payload => sendLlmRequest(payload, { managed: ecsAi, auth: supabase?.auth })
 const DEFAULT_PASSAGE = { id: 'default', sentence: 'After hours of driving, we finally found a quiet parking space behind the museum.', translation: '开了几个小时的车后，我们终于在博物馆后面找到一个安静的停车位。' }
 const saved = readStorageJson(localStorage, STORE, {})
 const passages = ref([DEFAULT_PASSAGE, ...(saved.passages || []).filter(p => p.id !== 'default')])
@@ -616,7 +619,7 @@ async function submitAuth({ mode, email, password }) {
   try {
     const result = mode === 'login'
       ? await supabase.auth.signInWithPassword({ email: email.trim(), password })
-      : await supabase.auth.signUp({ email: email.trim(), password })
+      : await supabase.auth.signUp({ email: email.trim(), password, ...(ecsAi && { options: { emailRedirectTo: window.location.origin } }) })
     if (result.error) throw result.error
     if (mode === 'register' && !result.data.session) {
       authMessage.value = '注册成功，请检查邮箱并完成验证后登录。'
@@ -685,16 +688,16 @@ function placeholder(word) {
 }
 async function fetchWordContext(word, fullSentence) {
   console.log('开始请求LLM:', word)
-  if (!apiKey.value.trim()) throw new Error('未配置 API Key')
+  if (!ecsAi && !apiKey.value.trim()) throw new Error('未配置 API Key')
   const base = apiBaseUrl.value.trim().replace(/\/+$/, '')
-  if (!base || !apiModel.value.trim()) throw new Error('请填写有效的 Base URL 和 Model')
+  if (!ecsAi && (!base || !apiModel.value.trim())) throw new Error('请填写有效的 Base URL 和 Model')
   const maxRetries = 2
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     let rawContent = null
     try {
       // 使用 JSON 模式并提高输出上限，降低格式漂移和内容截断概率。
       // 深度词源 JSON 较长，提升上限避免例句字段被截断。
-      const response = await fetch('/api/llm', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ baseUrl: base, model: apiModel.value.trim(), apiKey: apiKey.value.trim(), temperature: 0.2, max_tokens: 8000, response_format: { type: 'json_object' }, messages: [{ role: 'system', content: '你是英语词源与语境解析专家。全文中文内容必须使用简体中文，英文例句及词源原文可保留英文。只输出一个严格合法、可被 JSON.parse 解析的 JSON 对象，不要 Markdown、代码围栏、注释或任何额外文字。所有字符串中的双引号和换行必须正确转义。examples 必须正好 2 条，semanticRoutes 必须正好 3 条。格式示例：{"text":"word","type":"word","pronunciation":"/wɜːd/","partOfSpeech":"名词","definition":"语境释义","usage":"用法","etymology":{"prefix":"无","root":"词根","suffix":"无","origin":"来源","originalImage":"原始画面","certainty":"较确定"},"semanticRoutes":[{"label":"线路A","steps":"演变过程","modernMeaning":"现代义","domain":"日常"},{"label":"线路B","steps":"演变过程","modernMeaning":"现代义","domain":"商业"},{"label":"线路C","steps":"演变过程","modernMeaning":"现代义","domain":"技术"}],"comparisons":[{"word":"near-synonym","partOfSpeech":"名词","difference":"区别"}],"examples":[{"text":"Example sentence.","translation":"例句译文","contextNote":"语境说明"},{"text":"Another example.","translation":"另一例句","contextNote":"语境说明"}]}。必须包含全部字段。' }, { role: 'user', content: `当前完整句子：${fullSentence}\n目标词/词组：${word}\n只返回符合 schema 的 JSON。` }] }) })
+      const response = await requestLlm({ baseUrl: base, model: apiModel.value.trim(), apiKey: apiKey.value.trim(), temperature: 0.2, max_tokens: 8000, response_format: { type: 'json_object' }, messages: [{ role: 'system', content: '你是英语词源与语境解析专家。全文中文内容必须使用简体中文，英文例句及词源原文可保留英文。只输出一个严格合法、可被 JSON.parse 解析的 JSON 对象，不要 Markdown、代码围栏、注释或任何额外文字。所有字符串中的双引号和换行必须正确转义。examples 必须正好 2 条，semanticRoutes 必须正好 3 条。格式示例：{"text":"word","type":"word","pronunciation":"/wɜːd/","partOfSpeech":"名词","definition":"语境释义","usage":"用法","etymology":{"prefix":"无","root":"词根","suffix":"无","origin":"来源","originalImage":"原始画面","certainty":"较确定"},"semanticRoutes":[{"label":"线路A","steps":"演变过程","modernMeaning":"现代义","domain":"日常"},{"label":"线路B","steps":"演变过程","modernMeaning":"现代义","domain":"商业"},{"label":"线路C","steps":"演变过程","modernMeaning":"现代义","domain":"技术"}],"comparisons":[{"word":"near-synonym","partOfSpeech":"名词","difference":"区别"}],"examples":[{"text":"Example sentence.","translation":"例句译文","contextNote":"语境说明"},{"text":"Another example.","translation":"另一例句","contextNote":"语境说明"}]}。必须包含全部字段。' }, { role: 'user', content: `当前完整句子：${fullSentence}\n目标词/词组：${word}\n只返回符合 schema 的 JSON。` }] })
       if (!response.ok) {
         const detail = await response.text().catch(() => '')
         const hint = response.status === 401 ? 'API Key 无效或权限不足。' : response.status === 403 ? '当前 Key 无权调用该模型。' : response.status === 404 ? '检查 Base URL、接口路径和模型服务商文档。' : `HTTP ${response.status}`
@@ -741,19 +744,19 @@ async function analyze(key, countLookup = true) {
     cache.value[cacheKey] = { ...parsed, id: key, text: parsed.text || key, dynamic: true, llmSuccess: true, deepSchema: 4, context_sentence: activePassage.value.sentence, context_translation: activePassage.value.translation || '', is_starred: previous.is_starred || false, review_count: previous.review_count || 0, next_review_at: previous.next_review_at, lookup_count: Math.max(Number(previous.lookup_count) || 0, Number(lookupCounts.value[key.trim().toLowerCase()]) || 0) }
     await saveCloudNote(key, activePassage.value.id, cache.value[cacheKey], false)
   } catch (cause) {
-    error.value = '解析失败，点击重试'
+    error.value = cause instanceof AiAccessError ? cause.message : '解析失败，点击重试'
     console.error('[fetchWordContext]', { baseUrl: apiBaseUrl.value, model: apiModel.value, word: key, error: cause })
   } finally { loading.value = false }
 }
 async function translateSentencesBatch(sentences) {
-  if (!apiKey.value.trim()) throw new Error('请先在设置中填写 API Key')
+  if (!ecsAi && !apiKey.value.trim()) throw new Error('请先在设置中填写 API Key')
   const base = apiBaseUrl.value.trim().replace(/\/+$/, '')
   const indexedSentences = sentences.map((sentence, i) => ({ i, english: sentence }))
   const maxRetries = 2
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     let rawContent = null
     try {
-      const response = await fetch('/api/llm', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ baseUrl: base, model: apiModel.value.trim(), apiKey: apiKey.value.trim(), temperature: 0.3, max_tokens: 4000, messages: [{ role: 'system', content: '你是专业英语译者。将每句英文译成自然、准确、流畅的简体中文，兼顾信、达、雅。必须只输出一个严格合法的 JSON 数组，不要 Markdown、代码围栏或解释。数组每项格式为 {"i":0,"zh":"译文"}，i 必须对应输入编号，所有输入句子都必须有一项。' }, { role: 'user', content: JSON.stringify(indexedSentences) }] }) })
+      const response = await requestLlm({ baseUrl: base, model: apiModel.value.trim(), apiKey: apiKey.value.trim(), temperature: 0.3, max_tokens: 4000, messages: [{ role: 'system', content: '你是专业英语译者。将每句英文译成自然、准确、流畅的简体中文，兼顾信、达、雅。必须只输出一个严格合法的 JSON 数组，不要 Markdown、代码围栏或解释。数组每项格式为 {"i":0,"zh":"译文"}，i 必须对应输入编号，所有输入句子都必须有一项。' }, { role: 'user', content: JSON.stringify(indexedSentences) }] })
       if (!response.ok) throw new Error(`翻译服务暂不可用（${response.status}）`)
       const responseText = await response.text()
       rawContent = responseText
@@ -1079,7 +1082,7 @@ onBeforeUnmount(() => deleteTimers.forEach(timer => clearTimeout(timer)))
 <button v-else-if="supabase" class="rounded-full border border-[#dce4d8] bg-white px-3 py-2 text-xs text-[#49634e] hover:bg-[#f0f4ed]" @click="openLoginModal"><span class="sm:hidden">登录</span><span class="hidden sm:inline">登录 / 注册</span></button><button
         class="rounded-full border border-[#e5e3dc] bg-white px-3 py-2 text-xs" @click="openWordBook"><span class="sm:hidden">⭐ 生词</span><span class="hidden sm:inline">⭐ 生词本</span></button><span v-if="syncNotice" class="hidden text-[10px] text-[#a36b5b] md:inline">{{ syncNotice }}</span><button class="rounded-full border border-[#e5e3dc] bg-white px-4 py-2 text-xs" @click="showSettings = !showSettings">⚙ 设置</button></div>
     </header>
-    <SettingsModal :open="showSettings" :default-blur-translation="defaultBlurTranslation" :daily-review-goal="dailyReviewGoal" :api-base-url="apiBaseUrl" :api-model="apiModel" :api-key="apiKey" @close="showSettings = false" @update:defaultBlurTranslation="defaultBlurTranslation = $event" @update:dailyReviewGoal="dailyReviewGoal = $event" @update:apiBaseUrl="apiBaseUrl = $event" @update:apiModel="apiModel = $event" @update:apiKey="apiKey = $event" @export-backup="exportBackup" @import-file="importBackup" @export-anki="exportAnki" />
+    <SettingsModal :managed-ai="ecsAi" :open="showSettings" :default-blur-translation="defaultBlurTranslation" :daily-review-goal="dailyReviewGoal" :api-base-url="apiBaseUrl" :api-model="apiModel" :api-key="apiKey" @close="showSettings = false" @update:defaultBlurTranslation="defaultBlurTranslation = $event" @update:dailyReviewGoal="dailyReviewGoal = $event" @update:apiBaseUrl="apiBaseUrl = $event" @update:apiModel="apiModel = $event" @update:apiKey="apiKey = $event" @export-backup="exportBackup" @import-file="importBackup" @export-anki="exportAnki" />
     <div class="reading-content mx-auto flex min-h-0 w-full flex-1 flex-col px-5 pb-5 pt-3 md:px-8 md:pt-3">
       <div class="mb-4 flex items-end justify-between md:mb-3">
         <div>

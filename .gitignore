@@ -9,6 +9,12 @@ coverage/
 .env
 .env.*
 !.env.example
+secrets/
+*.pem
+*.key
+deploy/backups/
+quota.json
+quota.json.tmp
 
 # Logs and debug output
 *.log

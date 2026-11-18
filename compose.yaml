@@ -1,0 +1,79 @@
+name: english-context-reader
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: 5m
+    max-file: "3"
+
+services:
+  web:
+    image: ${IMAGE_PREFIX:-english-context-reader}-web:${RELEASE:-local}
+    build:
+      context: .
+      target: web
+      args:
+        VITE_SUPABASE_URL: ${VITE_SUPABASE_URL:-}
+        VITE_SUPABASE_ANON_KEY: ${VITE_SUPABASE_ANON_KEY:-}
+    ports:
+      - "127.0.0.1:${WEB_PORT:-8080}:80"
+    networks: [edge, app]
+    mem_limit: 128m
+    cpus: 0.50
+    restart: unless-stopped
+    logging: *logging
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+
+  api:
+    image: ${IMAGE_PREFIX:-english-context-reader}-api:${RELEASE:-local}
+    build:
+      context: .
+      target: api
+    environment:
+      SUPABASE_URL: ${VITE_SUPABASE_URL:?Set VITE_SUPABASE_URL}
+      SUPABASE_PUBLISHABLE_KEY: ${VITE_SUPABASE_ANON_KEY:?Set VITE_SUPABASE_ANON_KEY}
+      AI_ALLOWED_USER_IDS: ${AI_ALLOWED_USER_IDS:?Set AI_ALLOWED_USER_IDS}
+      AI_ACCOUNT_DAILY_CALLS: ${AI_ACCOUNT_DAILY_CALLS:-30}
+      AI_GLOBAL_DAILY_CALLS: ${AI_GLOBAL_DAILY_CALLS:-100}
+      AI_GLOBAL_DAILY_UNITS: ${AI_GLOBAL_DAILY_UNITS:-500000}
+    secrets: [deepseek_api_key]
+    volumes:
+      - quota:/var/lib/reader
+    networks: [app, egress]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 384m
+    cpus: 1.00
+    pids_limit: 64
+    restart: unless-stopped
+    stop_grace_period: 25s
+    logging: *logging
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/healthz').then(r=>{if(!r.ok)process.exitCode=1}).catch(()=>{process.exitCode=1})"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+
+networks:
+  edge:
+  app:
+    internal: true
+  egress:
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.name: br-ecr-egress
+
+volumes:
+  quota:
+
+secrets:
+  deepseek_api_key:
+    file: ${DEEPSEEK_KEY_PATH:-./secrets/deepseek_api_key}
