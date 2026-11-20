@@ -16,13 +16,19 @@
 service_role、sb_secret、数据库密码。这里只检查配置格式和审核标记，不连接 Supabase 验证项目，
 须由维护者确认两个值来自同一正确项目且 RLS 已启用；本轮未读取或更改仓库变量。
 
-首次发布按以下顺序执行：
+初始化和正式发布使用同一个工作流、`ecs-ghcr-release` Environment 和 Required reviewers。
+每个已审核提交在工作流中固定一个 `RELEASE_MODE`。先用 `bootstrap-web` 初始化并验收 Web 私有包；
+如 API 包经所有者检查仍未找到，再以另一个提交切换为 `bootstrap-api`。已存在的合规私有 API 包直接复用。
+占位镜像只有标记文件，使用独立的 `bootstrap-*` 标签；每个包确认 Private、Actions Write/Admin，
+以及授权可按 Digest 拉取、匿名无法拉取后，再切换为 `publish`。
+
+每次运行按以下顺序执行：
 
 1. 核对 Vercel 项目 Production → Branch Tracking 及生产域名的分支绑定。若指向部署分支或无法确认，先停止。
-2. 由管理员预建 `ecs-ghcr-release` Environment，限定 `feat/ecs-deployment` 分支。可用时开启 Required reviewers，禁止自审和管理员绕过。若套餐不支持 Required reviewers，单独确认是否接受由管理员写入精确提交 SHA 的人工门槛。不能把自动创建的空 Environment 当作审批。
+2. 复用已有 `ecs-ghcr-release` 和 Required reviewers。三个 Supabase 变量沿用已审核值，初始化步骤不会读取它们。
 3. 获得提交授权后，提交已审核的工作流及脚本。在该 Environment 的 Variables 内设置 `ECS_APPROVED_PUBLISHER_SHA` 为此**发布工具提交**的完整 SHA，不在组织或仓库级定义同名变量。先不要推送。
 4. 获得推送及发布授权后，只推送 `feat/ecs-deployment`。首次 push 必须包含 `.github/workflows/ecs-image-publish.yml` 的变化。开启 Required reviewers 时，在 Actions 核对运行的发布工具 SHA 和固定源码 SHA，再由指定 reviewer 批准。Environment 没有审批变量或值不匹配时，首步失败。
-5. 等两包核验成功，下载并保存同一次运行的 `release.lock.yaml` 和 `release.json`。核对包权限与两个 Digest 后可清除 Environment 的发布工具批准变量，避免后续新运行沿用。
+5. 仅正式发布模式在两包核验成功后输出 `release.lock.yaml` 和 `release.json`。保存同一次运行的两个文件。
 
 发布工具 SHA 与源码 SHA 是独立门槛。同一批准值可以授权同一提交的新运行，Environment reviewers 若已开启仍须按 GitHub 的规则审查。管理员与可编辑工作流或分支的人仍属于信任边界，应限制部署分支写权限。
 
@@ -45,9 +51,9 @@ UID/密钥挂载/配额持久化、取消及优雅关闭验证；测试网络隔
 测试使用合成 Key，但前端构建使用已审核公开配置，不重新构建另一批未经测试的发布镜像。
 清理临时密钥、构建日志、测试容器和卷；不上传诊断日志、环境文件或镜像 tar。
 
-发布前同时预检两个包：包已存在则必须 private；已有 SHA 标签的 config digest
+发布前同时预检两个包：`english-context-reader-web-private` 和 `english-context-reader-api` 均须已存在且为 private；已有 SHA 标签的 config digest
 必须等于本地镜像 ID，否则在第一次 push 前停止。内容一致则跳过该镜像 push。
-首次新包使用 GHCR 默认 private，并在发布后通过 API 再核实 visibility。
+初始化时使用 GHCR 默认的 private 可见性，并在上传占位镜像后通过 API 核实。
 每次 push 前再次检查标签，发布后按 digest 回读 manifest；只在两个包都通过后生成：
 
 - `release.lock.yaml`：Compose override，Web/API 使用 image@sha256 且 platform:linux/amd64。

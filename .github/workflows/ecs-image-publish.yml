@@ -23,11 +23,10 @@ jobs:
       contents: read
       packages: write
     env:
+      # One operation per reviewed revision: bootstrap-web, bootstrap-api, or publish.
+      RELEASE_MODE: bootstrap-web
       SOURCE_SHA: 73bb384ee031452cd2a7a2f1a16cbee74aa0ec97
-      CI_BUILD_IMAGE_PREFIX: ghcr.io/hendysen01/english-context-reader
-      CI_PUBLIC_SUPABASE_URL: ${{ vars.ECS_PUBLIC_SUPABASE_URL }}
-      CI_PUBLIC_SUPABASE_KEY: ${{ vars.ECS_PUBLIC_SUPABASE_KEY }}
-      CONFIG_APPROVED_SHA: ${{ vars.ECS_PUBLIC_CONFIG_APPROVED_SHA }}
+      CI_BUILD_IMAGE_PREFIX: ecs-audited
     steps:
       - name: Require explicit approval of this publishing revision
         env:
@@ -37,21 +36,35 @@ jobs:
             echo 'This publishing revision is not approved.' >&2
             exit 1
           fi
+          case "$RELEASE_MODE" in bootstrap-web|bootstrap-api|publish) ;; *) exit 1 ;; esac
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
           path: publisher
           persist-credentials: false
+      - name: Initialize one private package
+        if: env.RELEASE_MODE == 'bootstrap-web' || env.RELEASE_MODE == 'bootstrap-api'
+        env:
+          APPROVED_SHA: ${{ vars.ECS_APPROVED_PUBLISHER_SHA }}
+          GHCR_TOKEN: ${{ github.token }}
+        run: python3 -B publisher/deploy/publish/bootstrap.py
       - uses: actions/checkout@v4
+        if: env.RELEASE_MODE == 'publish'
         with:
           ref: 73bb384ee031452cd2a7a2f1a16cbee74aa0ec97
           path: source
           persist-credentials: false
       - uses: actions/setup-node@v4
+        if: env.RELEASE_MODE == 'publish'
         with:
           node-version: '24'
       - name: Confirm source and approved public configuration
+        if: env.RELEASE_MODE == 'publish'
         working-directory: source
+        env:
+          CI_PUBLIC_SUPABASE_URL: ${{ vars.ECS_PUBLIC_SUPABASE_URL }}
+          CI_PUBLIC_SUPABASE_KEY: ${{ vars.ECS_PUBLIC_SUPABASE_KEY }}
+          CONFIG_APPROVED_SHA: ${{ vars.ECS_PUBLIC_CONFIG_APPROVED_SHA }}
         run: |
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
           test "$CONFIG_APPROVED_SHA" = "$SOURCE_SHA"
@@ -63,24 +76,31 @@ jobs:
             }
           '
       - name: Test publication guards without registry access
+        if: env.RELEASE_MODE == 'publish'
         working-directory: publisher
         run: |
           python3 -B -m unittest discover -s test -p 'registry_test.py' -v
           node --test test/public-config.test.js
       - name: Test, build and audit the exact release images
+        if: env.RELEASE_MODE == 'publish'
         working-directory: source
+        env:
+          CI_PUBLIC_SUPABASE_URL: ${{ vars.ECS_PUBLIC_SUPABASE_URL }}
+          CI_PUBLIC_SUPABASE_KEY: ${{ vars.ECS_PUBLIC_SUPABASE_KEY }}
         run: |
           npm ci --no-audit --no-fund
           npm test
           export CI_BUILD_RELEASE="$SOURCE_SHA"
           bash ../publisher/deploy/ci/verify.sh
       - name: Check private packages and publish without overwriting a version
+        if: env.RELEASE_MODE == 'publish'
         working-directory: source
         env:
           GHCR_TOKEN: ${{ github.token }}
           GHCR_USER: ${{ github.actor }}
         run: python3 ../publisher/deploy/publish/registry.py
       - name: Save verified release references
+        if: env.RELEASE_MODE == 'publish'
         uses: actions/upload-artifact@v4
         with:
           name: ecs-release-73bb384ee031452cd2a7a2f1a16cbee74aa0ec97

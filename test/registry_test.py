@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 spec = importlib.util.spec_from_file_location('registry', Path(__file__).resolve().parents[1] / 'deploy/publish/registry.py')
 r = importlib.util.module_from_spec(spec)
@@ -22,6 +22,7 @@ class PublicationTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.addCleanup(os.chdir, self.previous)
         self.local = {'Architecture': 'amd64', 'Os': 'linux', 'Id': 'sha256:' + 'a' * 64, 'Size': 100}
+        self.progress = r.Progress()
         self.remote = ('sha256:' + 'b' * 64, {'config': {'digest': self.local['Id']}, 'layers': [{'size': 25}]})
         self.env = patch.dict(os.environ, SOURCE_SHA=r.SHA, GHCR_TOKEN='synthetic-token', GHCR_USER='test-user')
         self.env.start()
@@ -45,7 +46,7 @@ class PublicationTests(unittest.TestCase):
              patch.object(r.subprocess, 'run') as commands:
             try:
                 with contextlib.redirect_stdout(io.StringIO()):
-                    r.main()
+                    r.main(self.progress)
             finally:
                 self.commands = commands.call_args_list
 
@@ -55,9 +56,12 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(self.commands, [])
 
     def test_conflicting_tag_stops_before_any_write(self):
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(r.PublishError) as caught:
             self.execute(conflict=True)
         self.assertEqual(self.commands, [])
+        self.assertIn('phase=preflight-sha-manifest', self.progress.failure(caught.exception))
+        self.assertIn('reason=existing-sha-conflict', self.progress.failure(caught.exception))
+        self.assertEqual(set(self.progress.upload.values()), {'not-attempted'})
 
     def test_existing_tag_with_unknown_package_visibility_stops(self):
         with self.assertRaisesRegex(RuntimeError, 'visibility could not be verified'):
@@ -78,7 +82,9 @@ class PublicationTests(unittest.TestCase):
         data = json.loads(Path('release.json').read_text())
         self.assertEqual(set(data['images']), {'web', 'api'})
         self.assertIn('@sha256:', Path('release.lock.yaml').read_text())
-        self.assertEqual(sum(c.args[0][1] == 'push' for c in self.commands), 2)
+        uploads = [c.args[0][2] for c in self.commands if c.args[0][1] == 'push']
+        self.assertEqual(uploads, [f'ghcr.io/hendysen01/{name}:{r.SHA}' for name in
+                                  ('english-context-reader-web-private', 'english-context-reader-api')])
         login = self.commands[0]
         self.assertIn('--password-stdin', login.args[0])
         self.assertNotIn('synthetic-token', ' '.join(login.args[0]))
@@ -89,10 +95,48 @@ class PublicationTests(unittest.TestCase):
         self.assertFalse(any(c.args[0][1] == 'push' for c in self.commands))
 
     def test_partial_failure_does_not_emit_release_lock(self):
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(RuntimeError) as caught:
             self.execute(fail_second=True)
         self.assertFalse(Path('release.lock.yaml').exists())
         self.assertFalse(Path('release.json').exists())
+        log = self.progress.failure(caught.exception)
+        self.assertIn('phase=read-sha-manifest package=english-context-reader-api', log)
+        self.assertIn('english-context-reader-web-private=push-verified', log)
+        self.assertIn('english-context-reader-api=push-acknowledged', log)
+        self.assertNotIn('Synthetic registry failure', log)
+
+    def test_http_failures_log_status_without_response_contents_or_credentials(self):
+        for status, reason in [(401, 'authentication-rejected'), (403, 'access-forbidden'),
+                               (404, 'not-found-or-inaccessible'), (429, 'rate-limited')]:
+            with self.subTest(status=status):
+                failure = r.urllib.error.HTTPError('https://example.invalid', status, 'response-secret', {}, None)
+                with patch.object(r.opener, 'open', side_effect=failure):
+                    with self.assertRaises(r.PublishError) as caught:
+                        r.read('https://example.invalid', {'Authorization': 'Bearer header-secret'})
+                log = self.progress.failure(caught.exception)
+                self.assertIn(f'reason={reason} http={status}', log)
+                for secret in ['response-secret', 'header-secret', 'example.invalid']:
+                    self.assertNotIn(secret, log)
+
+    def test_digest_header_mismatch_has_safe_category(self):
+        response = Mock()
+        response.read.return_value = b'sensitive body'
+        response.headers = {'Docker-Content-Digest': 'untrusted value'}
+        with patch.object(r.opener, 'open') as open_request:
+            open_request.return_value.__enter__.return_value = response
+            with self.assertRaises(r.PublishError) as caught:
+                r.read('https://example.invalid', {})
+        log = self.progress.failure(caught.exception)
+        self.assertIn('reason=response-digest-mismatch', log)
+        self.assertNotIn('sensitive body', log)
+        self.assertNotIn('untrusted value', log)
+
+    def test_cli_does_not_print_subprocess_exception_or_output(self):
+        error = r.subprocess.CalledProcessError(1, ['sensitive argv'], stderr='sensitive stderr')
+        with patch.object(r, 'main', side_effect=error), contextlib.redirect_stderr(io.StringIO()) as stderr:
+            self.assertEqual(r.cli(), 1)
+        self.assertIn('reason=process-failed exit=1', stderr.getvalue())
+        self.assertNotIn('sensitive', stderr.getvalue())
 
     def test_wrong_source_stops_before_authentication(self):
         with patch.object(r, 'run', return_value='wrong'), patch.object(r, 'read') as network:
